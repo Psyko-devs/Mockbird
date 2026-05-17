@@ -71,8 +71,6 @@ Mockbird acts as an intelligent local proxy with **dual-layer caching**:
                ▼
          ┌──────────────┐
          │  Real API    │
-         │ PokeAPI      │
-         │ OpenWeather  │
          │ Any REST API │
          └──────────────┘
 ```
@@ -96,9 +94,9 @@ Mockbird acts as an intelligent local proxy with **dual-layer caching**:
 
 ### Configuration & Flexibility
 - ✅ **CLI flags**: `--target`, `--port`, `--dir` for full customization
-- ✅ **Custom upstream APIs**: Works with any REST API (PokeAPI, JSONPlaceholder, custom)
+- ✅ **Custom upstream APIs**: Works with any REST API
 - ✅ **Auto-directory creation**: Automatically creates cache directories
-- ✅ **Path extraction**: Correctly handles API prefixes (e.g., `/api/v2/pokemon/ditto`)
+- ✅ **Path extraction**: Correctly handles API prefixes in cache filenames
 
 ### Developer Experience
 - ✅ **Zero configuration**: Run and it just works
@@ -122,12 +120,10 @@ Mockbird acts as an intelligent local proxy with **dual-layer caching**:
 mockbird/
 ├── main.go                 # Core application (266 lines, production-ready)
 ├── go.mod                  # Go module definition
-├── GET_posts.json          # Default cache (JSONPlaceholder)
-├── GET_users.json          # Default cache (JSONPlaceholder)
 └── mockbird_cache/         # Default cache directory (auto-created)
-    ├── GET_pokemon_ditto.json
-    ├── GET_pokemon_bulbasaur.json
-    └── ...other endpoints
+    ├── GET_resource1.json
+    ├── GET_resource2.json
+    └── POST_resource.json
 ```
 
 ### Caching Architecture
@@ -223,7 +219,7 @@ go build -o mockbird
 
 ## 🚀 Quick Start
 
-### Basic Usage (JSONPlaceholder)
+### Basic Usage
 
 ```bash
 # Start with default settings
@@ -231,7 +227,7 @@ go run main.go
 ```
 
 This will:
-- 🎯 Target: `https://jsonplaceholder.typicode.com`
+- 🎯 Target: `https://jsonplaceholder.typicode.com` (default example API)
 - 🔊 Listen on: `http://127.0.0.1:8080`
 - 💾 Cache to: `./mockbird_cache`
 
@@ -243,24 +239,24 @@ const data = await response.json();
 console.log(data);
 ```
 
-### Advanced Usage (PokeAPI)
+### Custom Upstream API
 
 ```bash
 go run main.go \
-  --target https://pokeapi.co/api/v2 \
+  --target https://api.example.com/v1 \
   --port 3000 \
-  --dir ./pokemon_mocks
+  --dir ./my_api_cache
 ```
 
-First request to `/pokemon/ditto`:
+First request to `/resource`:
 ```
-🌐 RECORD MODE: Fetching from real API -> GET /pokemon/ditto
-💾 RECORDED: Saved new photocopy to GET_pokemon_ditto.json!
+🌐 RECORD MODE: Fetching from real API -> GET /resource
+💾 RECORDED: Saved new photocopy to GET_resource.json!
 ```
 
-Second request to `/pokemon/ditto`:
+Second request to `/resource`:
 ```
-🚀 RAM CACHE: Serving GET_pokemon_ditto.json instantly from memory!
+🚀 RAM CACHE: Serving GET_resource.json instantly from memory!
 ```
 
 ---
@@ -271,57 +267,57 @@ Second request to `/pokemon/ditto`:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--target` | string | `https://jsonplaceholder.typicode.com` | Upstream API to mock |
+| `--target` | string | `https://jsonplaceholder.typicode.com` | Upstream REST API to cache and mock |
 | `--port` | int | `8080` | Local port to listen on |
 | `--dir` | string | `./mockbird_cache` | Directory to store cache files |
 
 ### Examples
 
 ```bash
-# Target GitHub API, custom port and directory
+# Target any public REST API
 go run main.go \
-  --target https://api.github.com \
+  --target https://api.example.com/v1 \
   --port 4000 \
-  --dir ./github_mocks
+  --dir ./api_cache
 
-# Target OpenWeather API
+# Target another service with path prefix
 go run main.go \
-  --target https://api.openweathermap.org/data/2.5 \
+  --target https://service.example.com/api/v2 \
   --port 8888 \
-  --dir ./weather_cache
+  --dir ./service_cache
 
 # Target local backend during testing
 go run main.go \
   --target http://localhost:5000 \
   --port 9000 \
-  --dir ./local_api_cache
+  --dir ./local_backend_cache
 ```
 
 ---
 
 ## 💡 Usage Examples
 
-### Example 1: Frontend Development with PokeAPI
+### Example 1: Frontend Development
 
 ```bash
 # Terminal 1: Start Mockbird
 cd mockbird
 go run main.go \
-  --target https://pokeapi.co/api/v2 \
+  --target https://api.example.com \
   --port 3000 \
-  --dir ./pokemon_mocks
+  --dir ./api_cache
 ```
 
 ```bash
 # Terminal 2: Frontend development
-cd my-react-app
+cd my-app
 npm start
 ```
 
 ```javascript
-// React component - point to localhost instead of pokeapi.co
-async function getPokemon(name) {
-  const response = await fetch(`http://localhost:3000/pokemon/${name}`);
+// Your app component - point to localhost instead of real API
+async function fetchData(endpoint) {
+  const response = await fetch(`http://localhost:3000${endpoint}`);
   return response.json();
 }
 
@@ -330,8 +326,8 @@ async function getPokemon(name) {
 
 **First request flow:**
 - 🌐 Browser requests → Mockbird
-- 🌐 Mockbird fetches from PokeAPI
-- 💾 Response saved to `GET_pokemon_pikachu.json`
+- 🌐 Mockbird fetches from real API
+- 💾 Response saved automatically
 - 🚀 Browser gets response instantly
 
 **Second request flow (offline):**
@@ -339,11 +335,11 @@ async function getPokemon(name) {
 - 🚀 Mockbird serves from RAM cache
 - ⚡ Browser gets response (no internet needed!)
 
-### Example 2: Automated Testing with JSONPlaceholder
+### Example 2: Automated Testing
 
 ```bash
-# Start Mockbird
-go run main.go --dir ./test_cache
+# Start Mockbird with your target API
+go run main.go --target https://api.example.com --dir ./test_cache
 ```
 
 ```javascript
@@ -438,15 +434,15 @@ This prevents caching of error responses that might mislead development.
 
 ### Path Extraction for Custom APIs
 
-When using `--target https://pokeapi.co/api/v2`:
+When using an upstream API with path prefixes (e.g., `--target https://api.example.com/v2`):
 
 ```
-Upstream Response Path:  /api/v2/pokemon/ditto
-                                ▲
-                       Prefix to extract
+Upstream Response Path:  /v2/resource/123
+                             ▲
+                  Prefix to extract
                                 
-Original Path:           /pokemon/ditto
-Cache Key:               GET_pokemon_ditto.json
+Original Request Path:   /resource/123
+Cache Key:               GET_resource_123.json
 ```
 
 This ensures cache filenames are clean and reusable across different upstream API prefixes.
