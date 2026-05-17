@@ -8,17 +8,17 @@
 
 ## 📖 Table of Contents
 - [Overview](#overview)
-- [The Problem](#the-problem)
-- [The Solution](#the-solution)
-- [Key Features](#key-features)
-- [Architecture](#architecture)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [CLI Configuration](#cli-configuration)
-- [Usage Examples](#usage-examples)
-- [How It Works](#how-it-works)
-- [Technical Details](#technical-details)
-- [FAQ](#faq)
+- [The Problem](#-the-problem)
+- [The Solution](#-the-solution)
+- [Key Features](#-key-features)
+- [Architecture](#-architecture)
+- [Installation](#-installation)
+- [Quick Start](#-quick-start)
+- [CLI Configuration](#-cli-configuration)
+- [Usage Examples](#-usage-examples)
+- [How It Works](#-how-it-works)
+- [Technical Details](#-technical-details)
+- [FAQ](#-faq)
 
 ---
 
