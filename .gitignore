@@ -1,6 +1,7 @@
 # Ignore compiled binaries
-mockbird
-mockbird.exe
+/mockbird
+/mockbird.exe
+/mockbird-test.exe
 
 # Ignore the cached mock files
 *.json
