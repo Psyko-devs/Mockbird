@@ -1,0 +1,10 @@
+# Ignore compiled binaries
+mockbird
+mockbird.exe
+
+# Ignore the cached mock files
+*.json
+
+# Allow standard Go files
+!go.mod
+!go.sum
