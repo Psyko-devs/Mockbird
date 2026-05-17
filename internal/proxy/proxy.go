@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -26,25 +27,54 @@ type Cache interface {
 }
 
 type Options struct {
-	Target *url.URL
-	Cache  Cache
-	Client *http.Client
-	Pretty bool
-	Logger *slog.Logger
+	Target      *url.URL
+	Cache       Cache
+	Client      *http.Client
+	Pretty      bool
+	VaryHeaders []string
+	MaxBody     int64
+	MaxResponse int64
+	Logger      *slog.Logger
 }
 
 type Handler struct {
-	target *url.URL
-	cache  Cache
-	client *http.Client
-	pretty bool
-	logger *slog.Logger
-	group  singleflight.Group
+	target      *url.URL
+	cache       Cache
+	client      *http.Client
+	pretty      bool
+	varyHeaders []string
+	maxBody     int64
+	maxResponse int64
+	logger      *slog.Logger
+	group       singleflight.Group
 }
 
 type fetchResult struct {
-	entry     cache.Entry
-	cacheable bool
+	entry cache.Entry
+}
+
+type UpstreamErrorKind string
+
+const (
+	ErrTimeout           UpstreamErrorKind = "timeout"
+	ErrDNS               UpstreamErrorKind = "dns_error"
+	ErrTLS               UpstreamErrorKind = "tls_error"
+	ErrConnectionRefused UpstreamErrorKind = "connection_refused"
+	ErrCanceled          UpstreamErrorKind = "context_canceled"
+	ErrUpstream          UpstreamErrorKind = "upstream_error"
+)
+
+type UpstreamError struct {
+	Kind UpstreamErrorKind
+	Err  error
+}
+
+func (e *UpstreamError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *UpstreamError) Unwrap() error {
+	return e.Err
 }
 
 func New(opts Options) *Handler {
@@ -56,12 +86,23 @@ func New(opts Options) *Handler {
 	if client == nil {
 		client = http.DefaultClient
 	}
+	maxBody := opts.MaxBody
+	if maxBody <= 0 {
+		maxBody = 10 << 20
+	}
+	maxResponse := opts.MaxResponse
+	if maxResponse <= 0 {
+		maxResponse = 100 << 20
+	}
 	return &Handler{
-		target: opts.Target,
-		cache:  opts.Cache,
-		client: client,
-		pretty: opts.Pretty,
-		logger: logger,
+		target:      opts.Target,
+		cache:       opts.Cache,
+		client:      client,
+		pretty:      opts.Pretty,
+		varyHeaders: append([]string(nil), opts.VaryHeaders...),
+		maxBody:     maxBody,
+		maxResponse: maxResponse,
+		logger:      logger,
 	}
 }
 
@@ -71,46 +112,52 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readBody(r)
+	body, err := h.readBody(w, r)
 	if err != nil {
-		h.writeError(w, http.StatusBadRequest, "request_body_error", err)
+		h.writeError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", err)
 		return
 	}
 
-	key := cache.Key(r.Method, r.URL.Path, r.URL.RawQuery, body)
+	key := cache.Key(cache.KeyRequest{
+		Method:      r.Method,
+		Path:        r.URL.EscapedPath(),
+		RawQuery:    r.URL.RawQuery,
+		Body:        body,
+		Headers:     r.Header,
+		VaryHeaders: h.varyHeaders,
+	})
 	if entry, ok := h.cache.Get(key); ok {
 		h.logger.Debug("cache hit", "key", key, "method", r.Method, "path", r.URL.Path)
-		writeEntry(w, entry)
+		writeEntry(w, entry, h.pretty)
 		return
 	}
 
 	value, err, _ := h.group.Do(key, func() (any, error) {
 		if entry, ok := h.cache.Get(key); ok {
-			return fetchResult{entry: entry, cacheable: true}, nil
+			return fetchResult{entry: entry}, nil
 		}
-		return h.fetchAndMaybeCache(r.Context(), r, body, key)
+		return h.fetchAndMaybeCache(r, body, key)
 	})
 	if err != nil {
-		kind := classifyError(err)
-		h.logger.Error("upstream request failed", "key", key, "method", r.Method, "path", r.URL.Path, "kind", kind, "error", err)
-		writeJSONError(w, http.StatusBadGateway, kind, err.Error())
+		upstreamErr := classifyError(err)
+		h.logger.Error("upstream request failed", "key", key, "method", r.Method, "path", r.URL.Path, "kind", upstreamErr.Kind, "error", err)
+		writeJSONError(w, http.StatusBadGateway, string(upstreamErr.Kind), upstreamErr.Error())
 		return
 	}
 
 	result := value.(fetchResult)
-	writeEntry(w, result.entry)
+	if result.entry.StatusCode != 0 {
+		writeEntry(w, result.entry, h.pretty)
+	}
 }
 
-func (h *Handler) fetchAndMaybeCache(ctx context.Context, original *http.Request, body []byte, key string) (fetchResult, error) {
+func (h *Handler) fetchAndMaybeCache(original *http.Request, body []byte, key string) (fetchResult, error) {
 	upstreamURL := h.upstreamURL(original.URL)
-	req, err := http.NewRequestWithContext(ctx, original.Method, upstreamURL.String(), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(original.Context(), original.Method, upstreamURL.String(), bytes.NewReader(body))
 	if err != nil {
 		return fetchResult{}, err
 	}
-	copyHeader(req.Header, original.Header)
-	req.Header.Set("Accept-Encoding", "identity")
-	req.Header.Del("If-None-Match")
-	req.Header.Del("If-Modified-Since")
+	copyRequestHeader(req.Header, original.Header)
 	req.Host = h.target.Host
 
 	resp, err := h.client.Do(req)
@@ -119,25 +166,19 @@ func (h *Handler) fetchAndMaybeCache(ctx context.Context, original *http.Request
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, exceeded, err := readResponseBody(resp.Body, h.maxResponse)
 	if err != nil {
 		return fetchResult{}, err
 	}
-
-	headers := resp.Header.Clone()
-	bodyToStore := respBody
-	if h.pretty {
-		bodyToStore = prettyJSONIfPossible(headers, respBody)
-		if len(bodyToStore) != len(respBody) {
-			headers.Set("Content-Length", fmt.Sprintf("%d", len(bodyToStore)))
-		}
+	if exceeded {
+		return fetchResult{}, fmt.Errorf("upstream response exceeds max response size %d", h.maxResponse)
 	}
 
 	entry := cache.Entry{
 		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		Body:       bodyToStore,
-		CreatedAt:  time.Now(),
+		Headers:    responseHeaders(resp),
+		Body:       respBody,
+		CreatedAt:  time.Now().UTC(),
 	}
 
 	if isCacheable(resp.StatusCode) {
@@ -150,26 +191,29 @@ func (h *Handler) fetchAndMaybeCache(ctx context.Context, original *http.Request
 		h.logger.Debug("skipped non-cacheable upstream response", "key", key, "status", resp.StatusCode)
 	}
 
-	return fetchResult{entry: entry, cacheable: isCacheable(resp.StatusCode)}, nil
+	return fetchResult{entry: entry}, nil
 }
 
 func (h *Handler) upstreamURL(incoming *url.URL) *url.URL {
 	out := *h.target
 	out.Path = joinPaths(h.target.Path, incoming.Path)
-	out.RawPath = ""
-	if h.target.RawQuery == "" || incoming.RawQuery == "" {
-		out.RawQuery = h.target.RawQuery + incoming.RawQuery
-	} else {
-		out.RawQuery = h.target.RawQuery + "&" + incoming.RawQuery
+	out.RawPath = joinEscapedPaths(h.target.EscapedPath(), incoming.EscapedPath())
+	if (&url.URL{Path: out.Path}).EscapedPath() == out.RawPath {
+		out.RawPath = ""
 	}
+	out.RawQuery = mergeQueries(h.target.RawQuery, incoming.RawQuery)
+	out.Fragment = ""
 	return &out
 }
 
-func readBody(r *http.Request) ([]byte, error) {
+func (h *Handler) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	if r.Body == nil {
 		return nil, nil
 	}
-	body, err := io.ReadAll(r.Body)
+	defer r.Body.Close()
+
+	limited := http.MaxBytesReader(w, r.Body, h.maxBody)
+	body, err := io.ReadAll(limited)
 	if err != nil {
 		return nil, err
 	}
@@ -177,18 +221,71 @@ func readBody(r *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-func writeEntry(w http.ResponseWriter, entry cache.Entry) {
-	copyHeader(w.Header(), entry.Headers)
+func writeEntry(w http.ResponseWriter, entry cache.Entry, pretty bool) {
+	headers := w.Header()
+	copyResponseHeader(headers, entry.Headers)
+
+	body := entry.Body
+	if pretty {
+		body = prettyJSONIfPossible(entry.Headers, entry.Body)
+	}
+	headers.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	w.WriteHeader(entry.StatusCode)
-	_, _ = w.Write(entry.Body)
+	_, _ = w.Write(body)
 }
 
-func copyHeader(dst, src http.Header) {
+func readResponseBody(r io.Reader, limit int64) ([]byte, bool, error) {
+	var buf bytes.Buffer
+	n, err := io.CopyN(&buf, r, limit+1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	if n > limit {
+		return buf.Bytes(), true, nil
+	}
+	return buf.Bytes(), false, nil
+}
+
+func copyRequestHeader(dst, src http.Header) {
 	for key, values := range src {
+		if hopByHopHeader(key) {
+			continue
+		}
 		dst.Del(key)
 		for _, value := range values {
 			dst.Add(key, value)
 		}
+	}
+}
+
+func copyResponseHeader(dst, src http.Header) {
+	for key, values := range src {
+		if hopByHopHeader(key) || strings.EqualFold(key, "Transfer-Encoding") {
+			continue
+		}
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func responseHeaders(resp *http.Response) http.Header {
+	headers := resp.Header.Clone()
+	if resp.ContentLength >= 0 {
+		headers.Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
+	} else {
+		headers.Del("Content-Length")
+	}
+	return headers
+}
+
+func hopByHopHeader(key string) bool {
+	switch strings.ToLower(key) {
+	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -197,7 +294,7 @@ func isCacheable(status int) bool {
 }
 
 func prettyJSONIfPossible(headers http.Header, body []byte) []byte {
-	if !strings.Contains(strings.ToLower(headers.Get("Content-Type")), "json") || !json.Valid(body) {
+	if headers.Get("Content-Encoding") != "" || !strings.Contains(strings.ToLower(headers.Get("Content-Type")), "json") || !json.Valid(body) {
 		return body
 	}
 	var v any
@@ -211,21 +308,65 @@ func prettyJSONIfPossible(headers http.Header, body []byte) []byte {
 	return formatted
 }
 
-func joinPaths(base, path string) string {
-	switch {
-	case base == "" || base == "/":
-		if path == "" {
+func joinPaths(base, incoming string) string {
+	if base == "" || base == "/" {
+		if incoming == "" {
 			return "/"
 		}
-		return path
-	case path == "" || path == "/":
+		return incoming
+	}
+	if incoming == "" || incoming == "/" {
 		return base
-	case strings.HasSuffix(base, "/") && strings.HasPrefix(path, "/"):
-		return base + strings.TrimPrefix(path, "/")
-	case !strings.HasSuffix(base, "/") && !strings.HasPrefix(path, "/"):
-		return base + "/" + path
+	}
+	switch {
+	case strings.HasSuffix(base, "/") && strings.HasPrefix(incoming, "/"):
+		return base + strings.TrimPrefix(incoming, "/")
+	case !strings.HasSuffix(base, "/") && !strings.HasPrefix(incoming, "/"):
+		return base + "/" + incoming
 	default:
-		return base + path
+		return base + incoming
+	}
+}
+
+func joinEscapedPaths(base, incoming string) string {
+	if base == "" || base == "/" {
+		if incoming == "" {
+			return "/"
+		}
+		return incoming
+	}
+	if incoming == "" || incoming == "/" {
+		return base
+	}
+	switch {
+	case strings.HasSuffix(base, "/") && strings.HasPrefix(incoming, "/"):
+		return base + strings.TrimPrefix(incoming, "/")
+	case !strings.HasSuffix(base, "/") && !strings.HasPrefix(incoming, "/"):
+		return base + "/" + incoming
+	default:
+		return base + incoming
+	}
+}
+
+func mergeQueries(targetRaw, incomingRaw string) string {
+	values := url.Values{}
+	addQuery(values, targetRaw)
+	addQuery(values, incomingRaw)
+	return values.Encode()
+}
+
+func addQuery(dst url.Values, raw string) {
+	if raw == "" {
+		return
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return
+	}
+	for key, list := range values {
+		for _, value := range list {
+			dst.Add(key, value)
+		}
 	}
 }
 
@@ -244,25 +385,41 @@ func writeJSONError(w http.ResponseWriter, status int, kind, message string) {
 	})
 }
 
-func classifyError(err error) string {
+func classifyError(err error) *UpstreamError {
+	if errors.Is(err, context.Canceled) {
+		return &UpstreamError{Kind: ErrCanceled, Err: err}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &UpstreamError{Kind: ErrTimeout, Err: err}
+	}
+
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return "timeout"
+		return &UpstreamError{Kind: ErrTimeout, Err: err}
 	}
 
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
-		return "dns_error"
+		return &UpstreamError{Kind: ErrDNS, Err: err}
 	}
 
-	var tlsErr tls.RecordHeaderError
-	if errors.As(err, &tlsErr) {
-		return "tls_error"
+	var tlsRecordErr tls.RecordHeaderError
+	var tlsCertErr *tls.CertificateVerificationError
+	if errors.As(err, &tlsRecordErr) || errors.As(err, &tlsCertErr) {
+		return &UpstreamError{Kind: ErrTLS, Err: err}
 	}
 
-	if errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(strings.ToLower(err.Error()), "connection refused") {
-		return "connection_refused"
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return &UpstreamError{Kind: ErrConnectionRefused, Err: err}
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && errors.Is(opErr.Err, syscall.ECONNREFUSED) {
+		return &UpstreamError{Kind: ErrConnectionRefused, Err: err}
+	}
+	var pathErr *os.SyscallError
+	if errors.As(err, &pathErr) && errors.Is(pathErr.Err, syscall.ECONNREFUSED) {
+		return &UpstreamError{Kind: ErrConnectionRefused, Err: err}
 	}
 
-	return "upstream_error"
+	return &UpstreamError{Kind: ErrUpstream, Err: err}
 }

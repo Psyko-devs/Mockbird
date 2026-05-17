@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
 	"net/http"
@@ -35,6 +36,29 @@ func newTestHandler(t *testing.T, upstream http.HandlerFunc) (*Handler, *cache.M
 		Client: target.Client(),
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}), manager
+}
+
+func newTestHandlerWithOptions(t *testing.T, upstream http.HandlerFunc, opts func(*Options)) (*Handler, *cache.Manager) {
+	t.Helper()
+	target := httptest.NewServer(upstream)
+	t.Cleanup(target.Close)
+
+	store, err := storage.NewDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := cache.NewManager(cache.Options{MaxEntries: 10, TTL: time.Hour, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := Options{
+		Target: mustParseURL(t, target.URL),
+		Cache:  manager,
+		Client: target.Client(),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	opts(&options)
+	return New(options), manager
 }
 
 func mustParseURL(t *testing.T, raw string) *url.URL {
@@ -130,7 +154,7 @@ func TestProxyCacheInvalidation(t *testing.T) {
 	})
 
 	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/invalidate", nil))
-	key := cache.Key(http.MethodGet, "/invalidate", "", nil)
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/invalidate"})
 	if err := manager.Delete(key); err != nil {
 		t.Fatal(err)
 	}
@@ -139,6 +163,89 @@ func TestProxyCacheInvalidation(t *testing.T) {
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/invalidate", nil))
 	if rec.Body.String() != "2" {
 		t.Fatalf("body = %q, want 2 after invalidation", rec.Body.String())
+	}
+}
+
+func TestProxyTreatsReorderedQueriesAsEquivalent(t *testing.T) {
+	var calls atomic.Int32
+	handler, _ := newTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(r.URL.RawQuery))
+	})
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/users?b=2&a=1", nil))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/users?a=1&b=2", nil))
+
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1 for equivalent query order", calls.Load())
+	}
+	if rec.Body.String() != "a=1&b=2" && rec.Body.String() != "b=2&a=1" {
+		t.Fatalf("unexpected cached body %q", rec.Body.String())
+	}
+}
+
+func TestProxyUsesConfiguredVaryHeaders(t *testing.T) {
+	var calls atomic.Int32
+	handler, _ := newTestHandlerWithOptions(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(r.Header.Get("Authorization")))
+	}, func(opts *Options) {
+		opts.VaryHeaders = []string{"Authorization"}
+	})
+
+	reqA := httptest.NewRequest(http.MethodGet, "/profile", nil)
+	reqA.Header.Set("Authorization", "Bearer A")
+	handler.ServeHTTP(httptest.NewRecorder(), reqA)
+
+	reqB := httptest.NewRequest(http.MethodGet, "/profile", nil)
+	reqB.Header.Set("Authorization", "Bearer B")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqB)
+
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d, want 2 for different Vary values", calls.Load())
+	}
+	if rec.Body.String() != "Bearer B" {
+		t.Fatalf("body = %q, want Bearer B", rec.Body.String())
+	}
+}
+
+func TestProxyPrettyDoesNotMutateStoredCache(t *testing.T) {
+	handler, manager := newTestHandlerWithOptions(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}, func(opts *Options) {
+		opts.Pretty = true
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+	if rec.Body.String() == `{"ok":true}` {
+		t.Fatal("expected pretty response formatting at response boundary")
+	}
+
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/json"})
+	entry, ok := manager.Get(key)
+	if !ok {
+		t.Fatal("expected cache entry")
+	}
+	if string(entry.Body) != `{"ok":true}` {
+		t.Fatalf("stored body = %q, want raw compact JSON", string(entry.Body))
+	}
+}
+
+func TestProxyRejectsOversizedRequestBodies(t *testing.T) {
+	handler, _ := newTestHandlerWithOptions(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be called for oversized body")
+	}, func(opts *Options) {
+		opts.MaxBody = 4
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/too-large", bytes.NewBufferString("12345")))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
 	}
 }
 

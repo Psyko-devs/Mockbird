@@ -76,8 +76,11 @@ func main() {
 			Transport: transport,
 			Timeout:   60 * time.Second,
 		},
-		Pretty: cfg.Pretty,
-		Logger: logger,
+		Pretty:      cfg.Pretty,
+		VaryHeaders: cfg.VaryHeaders,
+		MaxBody:     cfg.MaxBody,
+		MaxResponse: cfg.MaxResponse,
+		Logger:      logger,
 	})
 
 	mux := http.NewServeMux()
@@ -98,6 +101,7 @@ func main() {
 			"cache_dir", cfg.Dir,
 			"ttl", cfg.TTL.String(),
 			"max_ram", cfg.MaxRAM,
+			"vary", cfg.VaryHeaders,
 		)
 		errCh <- httpServer.ListenAndServe()
 	}()

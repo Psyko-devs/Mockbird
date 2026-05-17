@@ -20,11 +20,11 @@ func (s *memoryStore) Load(key string) (Entry, error) {
 	if !ok {
 		return Entry{}, errors.New("missing")
 	}
-	return entry.Clone(), nil
+	return entry.DeepCopy(), nil
 }
 
 func (s *memoryStore) Save(key string, entry Entry) error {
-	s.entries[key] = entry.Clone()
+	s.entries[key] = entry.DeepCopy()
 	return nil
 }
 
@@ -38,12 +38,19 @@ func (s *memoryStore) Clear() error {
 	return nil
 }
 
-func (s *memoryStore) ListKeys() ([]string, error) {
-	keys := make([]string, 0, len(s.entries))
-	for key := range s.entries {
-		keys = append(keys, key)
+func (s *memoryStore) Snapshot() ([]SnapshotEntry, error) {
+	out := make([]SnapshotEntry, 0, len(s.entries))
+	for key, entry := range s.entries {
+		out = append(out, SnapshotEntry{
+			Key:        key,
+			StatusCode: entry.StatusCode,
+			Headers:    HTTPHeader(entry.Headers),
+			BodySize:   len(entry.Body),
+			CreatedAt:  entry.CreatedAt,
+			Source:     "disk",
+		})
 	}
-	return keys, nil
+	return out, nil
 }
 
 func TestManagerExpiresEntries(t *testing.T) {
@@ -52,7 +59,7 @@ func TestManagerExpiresEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := Key(http.MethodGet, "/expired", "", nil)
+	key := Key(KeyRequest{Method: http.MethodGet, Path: "/expired"})
 	if err := manager.Set(key, Entry{StatusCode: 200, Headers: http.Header{}, Body: []byte("old"), CreatedAt: time.Now().Add(-2 * time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,8 +78,8 @@ func TestManagerEvictsRAM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := Key(http.MethodGet, "/first", "", nil)
-	second := Key(http.MethodGet, "/second", "", nil)
+	first := Key(KeyRequest{Method: http.MethodGet, Path: "/first"})
+	second := Key(KeyRequest{Method: http.MethodGet, Path: "/second"})
 
 	_ = manager.Set(first, Entry{StatusCode: 200, Headers: http.Header{}, Body: []byte("first"), CreatedAt: time.Now()})
 	_ = manager.Set(second, Entry{StatusCode: 200, Headers: http.Header{}, Body: []byte("second"), CreatedAt: time.Now()})

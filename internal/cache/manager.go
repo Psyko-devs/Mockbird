@@ -13,7 +13,7 @@ type Store interface {
 	Save(key string, entry Entry) error
 	Delete(key string) error
 	Clear() error
-	ListKeys() ([]string, error)
+	Snapshot() ([]SnapshotEntry, error)
 }
 
 type Options struct {
@@ -31,14 +31,14 @@ type Manager struct {
 type SnapshotEntry struct {
 	Key        string     `json:"key"`
 	StatusCode int        `json:"status_code"`
-	Headers    httpHeader `json:"headers,omitempty"`
+	Headers    HTTPHeader `json:"headers,omitempty"`
 	BodySize   int        `json:"body_size"`
 	CreatedAt  time.Time  `json:"created_at"`
 	Source     string     `json:"source"`
 	Expired    bool       `json:"expired"`
 }
 
-type httpHeader map[string][]string
+type HTTPHeader map[string][]string
 
 func NewManager(opts Options) (*Manager, error) {
 	if opts.MaxEntries <= 0 {
@@ -67,7 +67,7 @@ func (m *Manager) Get(key string) (Entry, bool) {
 			_ = m.store.Delete(key)
 			return Entry{}, false
 		}
-		return entry.Clone(), true
+		return entry, true
 	}
 
 	entry, err := m.store.Load(key)
@@ -79,12 +79,11 @@ func (m *Manager) Get(key string) (Entry, bool) {
 		return Entry{}, false
 	}
 
-	m.ram.Add(key, entry.Clone())
-	return entry.Clone(), true
+	m.ram.Add(key, entry)
+	return entry, true
 }
 
 func (m *Manager) Set(key string, entry Entry) error {
-	entry = entry.Clone()
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now()
 	}
@@ -110,7 +109,7 @@ func (m *Manager) Len() int {
 }
 
 func (m *Manager) Snapshot() ([]SnapshotEntry, error) {
-	seen := make(map[string]SnapshotEntry)
+	seen := make(map[string]SnapshotEntry, m.ram.Len())
 	now := time.Now()
 
 	for _, key := range m.ram.Keys() {
@@ -121,19 +120,17 @@ func (m *Manager) Snapshot() ([]SnapshotEntry, error) {
 		seen[key] = snapshot(key, entry, "ram", now, m.ttl)
 	}
 
-	keys, err := m.store.ListKeys()
+	diskEntries, err := m.store.Snapshot()
 	if err != nil {
 		return nil, err
 	}
-	for _, key := range keys {
-		if _, ok := seen[key]; ok {
+	for _, entry := range diskEntries {
+		if _, ok := seen[entry.Key]; ok {
 			continue
 		}
-		entry, err := m.store.Load(key)
-		if err != nil {
-			continue
-		}
-		seen[key] = snapshot(key, entry, "disk", now, m.ttl)
+		entry.Source = "disk"
+		entry.Expired = now.Sub(entry.CreatedAt) > m.ttl
+		seen[entry.Key] = entry
 	}
 
 	out := make([]SnapshotEntry, 0, len(seen))
@@ -148,7 +145,7 @@ func snapshot(key string, entry Entry, source string, now time.Time, ttl time.Du
 	return SnapshotEntry{
 		Key:        key,
 		StatusCode: entry.StatusCode,
-		Headers:    httpHeader(entry.Headers.Clone()),
+		Headers:    HTTPHeader(entry.Headers.Clone()),
 		BodySize:   len(entry.Body),
 		CreatedAt:  entry.CreatedAt,
 		Source:     source,

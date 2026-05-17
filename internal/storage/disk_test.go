@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,7 +17,7 @@ func TestDiskStorePersistsFullEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	key := cache.Key(http.MethodGet, "/resource", "id=1", nil)
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/resource", RawQuery: "id=1"})
 	want := cache.Entry{
 		StatusCode: http.StatusCreated,
 		Headers: http.Header{
@@ -45,5 +48,57 @@ func TestDiskStorePersistsFullEntry(t *testing.T) {
 	}
 	if !got.CreatedAt.Equal(want.CreatedAt) {
 		t.Fatalf("created_at = %s, want %s", got.CreatedAt, want.CreatedAt)
+	}
+}
+
+func TestDiskStoreDetectsCorruption(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewDiskStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/corrupt"})
+	entry := cache.Entry{
+		StatusCode: http.StatusOK,
+		Headers:    http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       []byte("original"),
+		CreatedAt:  time.Now().UTC(),
+	}
+	if err := store.Save(key, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, key+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data[:len(data)-2], []byte(`xx"}`)...)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Load(key); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Load error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestDiskStoreSnapshotUsesIndex(t *testing.T) {
+	store, err := NewDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/snapshot"})
+	if err := store.Save(key, cache.Entry{StatusCode: 200, Headers: http.Header{}, Body: []byte("ok"), CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Key != key || entries[0].BodySize != 2 {
+		t.Fatalf("snapshot = %#v, want indexed metadata for %s", entries, key)
 	}
 }

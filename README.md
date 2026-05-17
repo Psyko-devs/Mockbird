@@ -1,9 +1,11 @@
 # Mockbird
 
-Mockbird is a reverse-proxy offline API recorder for local development and tests. It forwards requests to an upstream API, records successful responses, and can replay them later from a two-level cache:
+Mockbird is a lightweight HTTP reverse proxy that records upstream responses and replays them from a deterministic two-level cache:
 
 - L1 RAM cache: bounded LRU for hot responses.
-- L2 disk cache: persistent JSON files containing full response metadata.
+- L2 disk cache: persistent compact JSON records with full response metadata.
+
+Correctness rules: cache keys are deterministic, stored entries are immutable, and runtime formatting flags never change persisted cache bytes.
 
 ## Project Structure
 
@@ -29,6 +31,7 @@ go run ./cmd/mockbird \
   -dir=./mockbird_cache \
   -ttl=24h \
   -max-ram=1000 \
+  -vary=Authorization,Accept \
   -log-level=info
 ```
 
@@ -41,12 +44,32 @@ go run ./cmd/mockbird \
 | `-dir` | `./mockbird_cache` | L2 disk cache directory. |
 | `-ttl` | `24h` | Cache entry lifetime. Expired entries are ignored and refreshed. |
 | `-max-ram` | `1000` | Maximum number of L1 RAM cache entries. |
-| `-pretty` | `false` | Pretty-print JSON payloads only. Non-JSON payloads are never changed. |
+| `-max-body` | `10485760` | Maximum request body bytes read for hashing and proxying. |
+| `-max-response` | `104857600` | Maximum upstream response bytes to record. |
+| `-vary` | empty | Comma-separated request headers included in cache keys. |
+| `-pretty` | `false` | Pretty-print JSON only at response time. Stored cache bytes stay raw. |
 | `-log-level` | `info` | `debug`, `info`, `warn`, or `error`. |
+
+## Cache Keys
+
+Cache keys are filesystem-safe SHA-256 hex strings built from:
+
+- HTTP method
+- normalized path
+- sorted query parameters and sorted repeated query values
+- SHA-256 body hash for `POST`, `PUT`, and `PATCH`
+- configured request headers from `-vary`
+
+Examples:
+
+- `GET /users?a=1&b=2` and `GET /users?b=2&a=1` produce the same key.
+- `GET /users?id=1` and `GET /users?id=2` produce different keys.
+- `POST /login` with different bodies produces different keys.
+- `-vary=Authorization` separates otherwise identical requests by `Authorization`.
 
 ## Cache Format
 
-Each disk entry is stored as `<sha256>.json` and contains status, headers, creation time, and body bytes:
+Each disk entry is stored as `<sha256>.json`. The file is compact JSON with status, headers, raw body bytes, creation time, and a checksum:
 
 ```json
 {
@@ -56,22 +79,14 @@ Each disk entry is stored as `<sha256>.json` and contains status, headers, creat
     "ETag": ["\"abc\""]
   },
   "body": "eyJvayI6dHJ1ZX0=",
-  "created_at": "2026-05-17T12:00:00Z"
+  "created_at": "2026-05-17T12:00:00Z",
+  "checksum": "..."
 }
 ```
 
-`body` is base64 because it is a Go `[]byte` encoded as JSON. This preserves binary and non-JSON responses.
+`body` is base64 because Go encodes `[]byte` that way in JSON. This preserves binary, compressed, and non-JSON responses.
 
-## Cache Keys
-
-Cache keys are filesystem-safe SHA-256 hex strings built from:
-
-- HTTP method
-- request path
-- raw query string
-- SHA-256 body hash for `POST`, `PUT`, and `PATCH`
-
-That means `GET /users?id=1`, `GET /users?id=2`, and two `POST /login` calls with different bodies produce different cache entries.
+The storage layer also maintains `index.json` so cache inspection does not load every body from disk.
 
 ## Cache Management API
 
@@ -83,26 +98,25 @@ curl -X DELETE http://127.0.0.1:8080/__mockbird/cache
 curl -X DELETE http://127.0.0.1:8080/__mockbird/cache/{key}
 ```
 
-## Architectural Decisions
+## Architecture Notes
 
-- The proxy stores a `CacheEntry`, not just a body, so cached responses replay original status codes and headers such as `Location`, `ETag`, `Cache-Control`, and `Content-Type`.
-- RAM cache uses `github.com/hashicorp/golang-lru/v2`, preventing unbounded memory growth.
-- Disk cache writes full metadata atomically through a temp file and rename.
-- `golang.org/x/sync/singleflight` deduplicates concurrent cache misses for the same key.
-- `http.Server` plus signal handling provides graceful shutdown on Ctrl+C and SIGTERM.
-- `log/slog` replaces terminal animation, emoji logging, and decorative output with structured levels.
-- The HTTP transport has dial, TLS handshake, idle connection, response header, and client timeouts.
+- `cmd/mockbird` only parses config, creates dependencies, wires routes, and handles shutdown.
+- `internal/proxy` owns HTTP behavior: request body limits, upstream URL construction, header forwarding, response replay, and singleflight request deduplication.
+- `internal/cache` owns pure cache semantics: keys, TTL, LRU, RAM/disk coordination, invalidation, and snapshots.
+- `internal/storage` owns persistence: compact JSON, atomic writes, fsync where supported, checksums, and metadata indexing.
+- `internal/server` owns management routes only.
 
 ## Migration Notes
 
 - `main.go` moved to `cmd/mockbird/main.go`; run with `go run ./cmd/mockbird`.
-- Old cache files named like `GET_users.json` are not compatible. The new format uses hashed keys and stores full HTTP metadata.
-- Automatic JSON formatting is disabled by default. Use `-pretty` when readable JSON cache files are more important than byte-for-byte body preservation.
-- Cache clearing no longer requires deleting the directory manually; use `DELETE /__mockbird/cache`.
-- Logs are structured text records controlled by `-log-level`.
+- Old cache files named like `GET_users.json` are not compatible. The new cache uses deterministic SHA-256 filenames.
+- `-pretty` no longer changes stored cache files. It only formats JSON while writing the HTTP response and never touches non-JSON or encoded payloads.
+- Query parameter order no longer creates duplicate entries.
+- Cache inspection now uses `index.json`; deleting cache files manually may require deleting `index.json` or restarting to rebuild from disk.
 
 ## Test
 
 ```bash
 go test ./...
+go test -race ./...
 ```

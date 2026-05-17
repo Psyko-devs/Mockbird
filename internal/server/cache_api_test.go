@@ -21,7 +21,7 @@ func TestCacheAPIInspectClearAndDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := cache.Key(http.MethodGet, "/cached", "", nil)
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/cached"})
 	if err := manager.Set(key, cache.Entry{StatusCode: 200, Headers: http.Header{"ETag": []string{"abc"}}, Body: []byte("ok"), CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
