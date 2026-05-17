@@ -1,0 +1,2044 @@
+cmd/mockbird/main.go:
+package main
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/Psyko-devs/mockbird/internal/cache"
+	"github.com/Psyko-devs/mockbird/internal/config"
+	"github.com/Psyko-devs/mockbird/internal/proxy"
+	"github.com/Psyko-devs/mockbird/internal/server"
+	"github.com/Psyko-devs/mockbird/internal/storage"
+)
+
+func main() {
+	cfg, err := config.Parse(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+		os.Exit(2)
+	}
+
+	logger, err := newLogger(cfg.LogLevel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+		os.Exit(2)
+	}
+
+	target, err := url.Parse(cfg.Target)
+	if err != nil {
+		logger.Error("invalid target url", "target", cfg.Target, "error", err)
+		os.Exit(2)
+	}
+	if target.Scheme == "" || target.Host == "" {
+		logger.Error("target must include scheme and host", "target", cfg.Target)
+		os.Exit(2)
+	}
+
+	disk, err := storage.NewDiskStore(cfg.Dir)
+	if err != nil {
+		logger.Error("failed to initialize disk cache", "dir", cfg.Dir, "error", err)
+		os.Exit(1)
+	}
+
+	manager, err := cache.NewManager(cache.Options{
+		MaxEntries: cfg.MaxRAM,
+		TTL:        cfg.TTL,
+		Store:      disk,
+	})
+	if err != nil {
+		logger.Error("failed to initialize cache manager", "error", err)
+		os.Exit(1)
+	}
+
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	proxyHandler := proxy.New(proxy.Options{
+		Target: target,
+		Cache:  manager,
+		Client: &http.Client{
+			Transport: transport,
+			Timeout:   60 * time.Second,
+		},
+		Pretty:      cfg.Pretty,
+		VaryHeaders: cfg.VaryHeaders,
+		MaxBody:     cfg.MaxBody,
+		MaxResponse: cfg.MaxResponse,
+		Logger:      logger,
+	})
+
+	mux := http.NewServeMux()
+	server.RegisterCacheRoutes(mux, manager, logger)
+	mux.Handle("/", proxyHandler)
+
+	httpServer := &http.Server{
+		Addr:              fmt.Sprintf("127.0.0.1:%d", cfg.Port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		logger.Info("mockbird started",
+			"addr", "http://"+httpServer.Addr,
+			"target", cfg.Target,
+			"cache_dir", cfg.Dir,
+			"ttl", cfg.TTL.String(),
+			"max_ram", cfg.MaxRAM,
+			"vary", cfg.VaryHeaders,
+		)
+		errCh <- httpServer.ListenAndServe()
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case sig := <-stop:
+		logger.Info("shutdown signal received", "signal", sig.String())
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			logger.Error("server stopped unexpectedly", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(ctx); err != nil {
+		logger.Error("graceful shutdown failed", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("mockbird stopped")
+}
+
+func newLogger(level string) (*slog.Logger, error) {
+	var slogLevel slog.Level
+	switch level {
+	case "debug":
+		slogLevel = slog.LevelDebug
+	case "info":
+		slogLevel = slog.LevelInfo
+	case "warn":
+		slogLevel = slog.LevelWarn
+	case "error":
+		slogLevel = slog.LevelError
+	default:
+		return nil, fmt.Errorf("unsupported log level %q", level)
+	}
+
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slogLevel})), nil
+}
+
+
+cache/entry.go:
+package cache
+
+import (
+	"net/http"
+	"time"
+)
+
+type Entry struct {
+	StatusCode int         `json:"status_code"`
+	Headers    http.Header `json:"headers"`
+	Body       []byte      `json:"body"`
+	CreatedAt  time.Time   `json:"created_at"`
+}
+
+func (e Entry) DeepCopy() Entry {
+	return Entry{
+		StatusCode: e.StatusCode,
+		Headers:    e.Headers.Clone(),
+		Body:       append([]byte(nil), e.Body...),
+		CreatedAt:  e.CreatedAt,
+	}
+}
+
+func (e Entry) Expired(now time.Time, ttl time.Duration) bool {
+	return now.Sub(e.CreatedAt) > ttl
+}
+
+func (e Entry) BodySize() int {
+	return len(e.Body)
+}
+
+
+cache/key.go:
+package cache
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"net/url"
+	"path"
+	"sort"
+	"strings"
+)
+
+type KeyRequest struct {
+	Method      string
+	Path        string
+	RawQuery    string
+	Body        []byte
+	Headers     http.Header
+	VaryHeaders []string
+}
+
+func Key(req KeyRequest) string {
+	material := strings.Builder{}
+	material.WriteString(strings.ToUpper(req.Method))
+	material.WriteByte('\n')
+	material.WriteString(normalizePath(req.Path))
+	material.WriteByte('\n')
+	material.WriteString(normalizeQuery(req.RawQuery))
+	material.WriteByte('\n')
+	material.WriteString(bodyHash(req.Method, req.Body))
+	material.WriteByte('\n')
+	material.WriteString(varyMaterial(req.Headers, req.VaryHeaders))
+
+	sum := sha256.Sum256([]byte(material.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+func normalizePath(rawPath string) string {
+	if rawPath == "" {
+		return "/"
+	}
+	cleaned := path.Clean("/" + rawPath)
+	if strings.HasSuffix(rawPath, "/") && cleaned != "/" {
+		cleaned += "/"
+	}
+	return cleaned
+}
+
+func normalizeQuery(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery
+	}
+
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+		sort.Strings(values[key])
+	}
+	sort.Strings(keys)
+
+	normalized := url.Values{}
+	for _, key := range keys {
+		for _, value := range values[key] {
+			normalized.Add(key, value)
+		}
+	}
+	return normalized.Encode()
+}
+
+func bodyHash(method string, body []byte) string {
+	switch strings.ToUpper(method) {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		sum := sha256.Sum256(body)
+		return hex.EncodeToString(sum[:])
+	default:
+		return ""
+	}
+}
+
+func varyMaterial(headers http.Header, varyHeaders []string) string {
+	if len(varyHeaders) == 0 {
+		return ""
+	}
+	normalized := make([]string, 0, len(varyHeaders))
+	for _, header := range varyHeaders {
+		canonical := http.CanonicalHeaderKey(header)
+		values := append([]string(nil), headers.Values(canonical)...)
+		sort.Strings(values)
+		normalized = append(normalized, canonical+":"+strings.Join(values, "\x00"))
+	}
+	sort.Strings(normalized)
+	return strings.Join(normalized, "\n")
+}
+
+
+cache/manager.go:
+package cache
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	lru "github.com/hashicorp/golang-lru/v2"
+)
+
+type Store interface {
+	Load(key string) (Entry, error)
+	Save(key string, entry Entry) error
+	Delete(key string) error
+	Clear() error
+	Snapshot() ([]SnapshotEntry, error)
+}
+
+type Options struct {
+	MaxEntries int
+	TTL        time.Duration
+	Store      Store
+}
+
+type Manager struct {
+	ttl   time.Duration
+	ram   *lru.Cache[string, Entry]
+	store Store
+	mu    sync.Mutex
+}
+
+type SnapshotEntry struct {
+	Key        string     `json:"key"`
+	StatusCode int        `json:"status_code"`
+	Headers    HTTPHeader `json:"headers,omitempty"`
+	BodySize   int        `json:"body_size"`
+	CreatedAt  time.Time  `json:"created_at"`
+	Source     string     `json:"source"`
+	Expired    bool       `json:"expired"`
+}
+
+type HTTPHeader map[string][]string
+
+func NewManager(opts Options) (*Manager, error) {
+	if opts.MaxEntries <= 0 {
+		return nil, fmt.Errorf("max entries must be positive")
+	}
+	if opts.TTL <= 0 {
+		return nil, fmt.Errorf("ttl must be positive")
+	}
+	if opts.Store == nil {
+		return nil, fmt.Errorf("store is required")
+	}
+
+	manager := &Manager{
+		ttl:   opts.TTL,
+		store: opts.Store,
+	}
+
+	ram, err := lru.NewWithEvict[string, Entry](opts.MaxEntries, func(key string, _ Entry) {
+		_ = opts.Store.Delete(key)
+	})
+	if err != nil {
+		return nil, err
+	}
+	manager.ram = ram
+
+	return manager, nil
+}
+
+func (m *Manager) Get(key string) (Entry, bool) {
+	now := time.Now()
+
+	m.mu.Lock()
+	if entry, ok := m.ram.Get(key); ok {
+		if entry.Expired(now, m.ttl) {
+			m.ram.Remove(key)
+			m.mu.Unlock()
+			return Entry{}, false
+		}
+		m.mu.Unlock()
+		return entry, true
+	}
+	m.mu.Unlock()
+
+	entry, err := m.store.Load(key)
+	if err != nil {
+		return Entry{}, false
+	}
+	if entry.Expired(now, m.ttl) {
+		_ = m.store.Delete(key)
+		return Entry{}, false
+	}
+
+	m.mu.Lock()
+	m.ram.Add(key, entry)
+	m.mu.Unlock()
+	return entry, true
+}
+
+func (m *Manager) Set(key string, entry Entry) error {
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = time.Now()
+	}
+	if err := m.store.Save(key, entry); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	m.ram.Add(key, entry)
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) Delete(key string) error {
+	m.mu.Lock()
+	m.ram.Remove(key)
+	m.mu.Unlock()
+	return m.store.Delete(key)
+}
+
+func (m *Manager) Clear() error {
+	m.mu.Lock()
+	m.ram.Purge()
+	m.mu.Unlock()
+	return m.store.Clear()
+}
+
+func (m *Manager) Len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ram.Len()
+}
+
+func (m *Manager) Snapshot() ([]SnapshotEntry, error) {
+	now := time.Now()
+
+	m.mu.Lock()
+	seen := make(map[string]SnapshotEntry, m.ram.Len())
+	for _, key := range m.ram.Keys() {
+		entry, ok := m.ram.Peek(key)
+		if !ok {
+			continue
+		}
+		seen[key] = snapshot(key, entry, "ram", now, m.ttl)
+	}
+	m.mu.Unlock()
+
+	diskEntries, err := m.store.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range diskEntries {
+		if _, ok := seen[entry.Key]; ok {
+			continue
+		}
+		entry.Source = "disk"
+		entry.Expired = now.Sub(entry.CreatedAt) > m.ttl
+		seen[entry.Key] = entry
+	}
+
+	out := make([]SnapshotEntry, 0, len(seen))
+	for _, entry := range seen {
+		out = append(out, entry)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+func snapshot(key string, entry Entry, source string, now time.Time, ttl time.Duration) SnapshotEntry {
+	return SnapshotEntry{
+		Key:        key,
+		StatusCode: entry.StatusCode,
+		Headers:    HTTPHeader(entry.Headers.Clone()),
+		BodySize:   len(entry.Body),
+		CreatedAt:  entry.CreatedAt,
+		Source:     source,
+		Expired:    entry.Expired(now, ttl),
+	}
+}
+
+
+config/config.go:
+package config
+
+import (
+	"flag"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type Config struct {
+	Target      string
+	Port        int
+	Dir         string
+	TTL         time.Duration
+	MaxRAM      int
+	Pretty      bool
+	LogLevel    string
+	VaryHeaders []string
+	MaxBody     int64
+	MaxResponse int64
+}
+
+func Parse(args []string) (Config, error) {
+	cfg := Config{}
+	fs := flag.NewFlagSet("mockbird", flag.ContinueOnError)
+	fs.StringVar(&cfg.Target, "target", "https://jsonplaceholder.typicode.com", "upstream API to proxy and record")
+	fs.IntVar(&cfg.Port, "port", 8080, "local port to listen on")
+	fs.StringVar(&cfg.Dir, "dir", "./mockbird_cache", "directory for disk cache files")
+	fs.DurationVar(&cfg.TTL, "ttl", 24*time.Hour, "cache entry time-to-live")
+	fs.IntVar(&cfg.MaxRAM, "max-ram", 1000, "maximum L1 RAM cache entries")
+	fs.BoolVar(&cfg.Pretty, "pretty", false, "pretty-print JSON responses at replay time without changing stored cache bytes")
+	fs.StringVar(&cfg.LogLevel, "log-level", "info", "log level: debug, info, warn, error")
+	vary := fs.String("vary", "", "comma-separated request headers that participate in cache keys, for example Authorization,Accept")
+	fs.Int64Var(&cfg.MaxBody, "max-body", 10<<20, "maximum request body bytes to read for cache keys")
+	fs.Int64Var(&cfg.MaxResponse, "max-response", 100<<20, "maximum upstream response body bytes to record")
+
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	if cfg.Port <= 0 || cfg.Port > 65535 {
+		return Config{}, fmt.Errorf("port must be between 1 and 65535")
+	}
+	if cfg.TTL <= 0 {
+		return Config{}, fmt.Errorf("ttl must be positive")
+	}
+	if cfg.MaxRAM <= 0 {
+		return Config{}, fmt.Errorf("max-ram must be positive")
+	}
+	if cfg.MaxBody <= 0 {
+		return Config{}, fmt.Errorf("max-body must be positive")
+	}
+	if cfg.MaxResponse <= 0 {
+		return Config{}, fmt.Errorf("max-response must be positive")
+	}
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return Config{}, fmt.Errorf("log-level must be one of debug, info, warn, error")
+	}
+	cfg.VaryHeaders = parseHeaderList(*vary)
+
+	return cfg, nil
+}
+
+func parseHeaderList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	headers := make([]string, 0)
+	for _, part := range strings.Split(raw, ",") {
+		header := http.CanonicalHeaderKey(strings.TrimSpace(part))
+		if header == "" {
+			continue
+		}
+		if _, ok := seen[header]; ok {
+			continue
+		}
+		seen[header] = struct{}{}
+		headers = append(headers, header)
+	}
+	return headers
+}
+
+
+proxy/proxy.go:
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/Psyko-devs/mockbird/internal/cache"
+	"golang.org/x/sync/singleflight"
+)
+
+type Cache interface {
+	Get(key string) (cache.Entry, bool)
+	Set(key string, entry cache.Entry) error
+}
+
+type Options struct {
+	Target      *url.URL
+	Cache       Cache
+	Client      *http.Client
+	Pretty      bool
+	VaryHeaders []string
+	MaxBody     int64
+	MaxResponse int64
+	Logger      *slog.Logger
+}
+
+type Handler struct {
+	target      *url.URL
+	cache       Cache
+	client      *http.Client
+	pretty      bool
+	varyHeaders []string
+	maxBody     int64
+	maxResponse int64
+	logger      *slog.Logger
+	group       singleflight.Group
+}
+
+type fetchResult struct {
+	entry cache.Entry
+}
+
+type UpstreamErrorKind string
+
+const (
+	ErrTimeout           UpstreamErrorKind = "timeout"
+	ErrDNS               UpstreamErrorKind = "dns_error"
+	ErrTLS               UpstreamErrorKind = "tls_error"
+	ErrConnectionRefused UpstreamErrorKind = "connection_refused"
+	ErrCanceled          UpstreamErrorKind = "context_canceled"
+	ErrUpstream          UpstreamErrorKind = "upstream_error"
+)
+
+type UpstreamError struct {
+	Kind UpstreamErrorKind
+	Err  error
+}
+
+func (e *UpstreamError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *UpstreamError) Unwrap() error {
+	return e.Err
+}
+
+func New(opts Options) *Handler {
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	client := opts.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	maxBody := opts.MaxBody
+	if maxBody <= 0 {
+		maxBody = 10 << 20
+	}
+	maxResponse := opts.MaxResponse
+	if maxResponse <= 0 {
+		maxResponse = 100 << 20
+	}
+	return &Handler{
+		target:      opts.Target,
+		cache:       opts.Cache,
+		client:      client,
+		pretty:      opts.Pretty,
+		varyHeaders: append([]string(nil), opts.VaryHeaders...),
+		maxBody:     maxBody,
+		maxResponse: maxResponse,
+		logger:      logger,
+	}
+}
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/favicon.ico" {
+		http.NotFound(w, r)
+		return
+	}
+
+	body, err := h.readBody(w, r)
+	if err != nil {
+		h.writeError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", err)
+		return
+	}
+
+	key := cache.Key(cache.KeyRequest{
+		Method:      r.Method,
+		Path:        r.URL.EscapedPath(),
+		RawQuery:    r.URL.RawQuery,
+		Body:        body,
+		Headers:     r.Header,
+		VaryHeaders: h.varyHeaders,
+	})
+	if entry, ok := h.cache.Get(key); ok {
+		h.logger.Debug("cache hit", "key", key, "method", r.Method, "path", r.URL.Path)
+		writeEntry(w, entry, h.pretty)
+		return
+	}
+
+	value, err, _ := h.group.Do(key, func() (any, error) {
+		if entry, ok := h.cache.Get(key); ok {
+			return fetchResult{entry: entry}, nil
+		}
+		return h.fetchAndMaybeCache(r, body, key)
+	})
+	if err != nil {
+		upstreamErr := classifyError(err)
+		h.logger.Error("upstream request failed", "key", key, "method", r.Method, "path", r.URL.Path, "kind", upstreamErr.Kind, "error", err)
+		writeJSONError(w, http.StatusBadGateway, string(upstreamErr.Kind), upstreamErr.Error())
+		return
+	}
+
+	result := value.(fetchResult)
+	if result.entry.StatusCode != 0 {
+		writeEntry(w, result.entry, h.pretty)
+	}
+}
+
+func (h *Handler) fetchAndMaybeCache(original *http.Request, body []byte, key string) (fetchResult, error) {
+	upstreamURL := h.upstreamURL(original.URL)
+	req, err := http.NewRequestWithContext(original.Context(), original.Method, upstreamURL.String(), bytes.NewReader(body))
+	if err != nil {
+		return fetchResult{}, err
+	}
+	copyRequestHeader(req.Header, original.Header)
+	req.Host = h.target.Host
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return fetchResult{}, err
+	}
+	defer resp.Body.Close()
+
+	respBody, exceeded, err := readResponseBody(resp.Body, h.maxResponse)
+	if err != nil {
+		return fetchResult{}, err
+	}
+	if exceeded {
+		return fetchResult{}, fmt.Errorf("upstream response exceeds max response size %d", h.maxResponse)
+	}
+
+	entry := cache.Entry{
+		StatusCode: resp.StatusCode,
+		Headers:    responseHeaders(resp),
+		Body:       respBody,
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	if isCacheable(resp.StatusCode) {
+		if err := h.cache.Set(key, entry); err != nil {
+			h.logger.Warn("failed to persist cache entry", "key", key, "error", err)
+		} else {
+			h.logger.Info("recorded upstream response", "key", key, "method", original.Method, "path", original.URL.Path, "status", resp.StatusCode)
+		}
+	} else {
+		h.logger.Debug("skipped non-cacheable upstream response", "key", key, "status", resp.StatusCode)
+	}
+
+	return fetchResult{entry: entry}, nil
+}
+
+func (h *Handler) upstreamURL(incoming *url.URL) *url.URL {
+	out := *h.target
+	out.Path = joinPaths(h.target.Path, incoming.Path)
+	out.RawPath = joinEscapedPaths(h.target.EscapedPath(), incoming.EscapedPath())
+	if (&url.URL{Path: out.Path}).EscapedPath() == out.RawPath {
+		out.RawPath = ""
+	}
+	out.RawQuery = mergeQueries(h.target.RawQuery, incoming.RawQuery)
+	out.Fragment = ""
+	return &out
+}
+
+func (h *Handler) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	defer r.Body.Close()
+
+	limited := http.MaxBytesReader(w, r.Body, h.maxBody)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return body, nil
+}
+
+func writeEntry(w http.ResponseWriter, entry cache.Entry, pretty bool) {
+	headers := w.Header()
+	copyResponseHeader(headers, entry.Headers)
+
+	body := entry.Body
+	if pretty {
+		body = prettyJSONIfPossible(entry.Headers, entry.Body)
+	}
+	headers.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	w.WriteHeader(entry.StatusCode)
+	_, _ = w.Write(body)
+}
+
+func readResponseBody(r io.Reader, limit int64) ([]byte, bool, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
+	return body, int64(len(body)) > limit, nil
+}
+
+func copyRequestHeader(dst, src http.Header) {
+	for key, values := range src {
+		if hopByHopHeader(key) {
+			continue
+		}
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func copyResponseHeader(dst, src http.Header) {
+	for key, values := range src {
+		if hopByHopHeader(key) || strings.EqualFold(key, "Transfer-Encoding") {
+			continue
+		}
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func responseHeaders(resp *http.Response) http.Header {
+	headers := resp.Header.Clone()
+	if resp.ContentLength >= 0 {
+		headers.Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
+	} else {
+		headers.Del("Content-Length")
+	}
+	return headers
+}
+
+func hopByHopHeader(key string) bool {
+	switch strings.ToLower(key) {
+	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCacheable(status int) bool {
+	return status >= 200 && status < 400
+}
+
+func prettyJSONIfPossible(headers http.Header, body []byte) []byte {
+	if headers.Get("Content-Encoding") != "" || !strings.Contains(strings.ToLower(headers.Get("Content-Type")), "json") || !json.Valid(body) {
+		return body
+	}
+	var v any
+	if err := json.Unmarshal(body, &v); err != nil {
+		return body
+	}
+	formatted, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return body
+	}
+	return formatted
+}
+
+func joinPaths(base, incoming string) string {
+	if base == "" || base == "/" {
+		if incoming == "" {
+			return "/"
+		}
+		return incoming
+	}
+	if incoming == "" || incoming == "/" {
+		return base
+	}
+	switch {
+	case strings.HasSuffix(base, "/") && strings.HasPrefix(incoming, "/"):
+		return base + strings.TrimPrefix(incoming, "/")
+	case !strings.HasSuffix(base, "/") && !strings.HasPrefix(incoming, "/"):
+		return base + "/" + incoming
+	default:
+		return base + incoming
+	}
+}
+
+func joinEscapedPaths(base, incoming string) string {
+	if base == "" || base == "/" {
+		if incoming == "" {
+			return "/"
+		}
+		return incoming
+	}
+	if incoming == "" || incoming == "/" {
+		return base
+	}
+	switch {
+	case strings.HasSuffix(base, "/") && strings.HasPrefix(incoming, "/"):
+		return base + strings.TrimPrefix(incoming, "/")
+	case !strings.HasSuffix(base, "/") && !strings.HasPrefix(incoming, "/"):
+		return base + "/" + incoming
+	default:
+		return base + incoming
+	}
+}
+
+func mergeQueries(targetRaw, incomingRaw string) string {
+	values := url.Values{}
+	addQuery(values, targetRaw)
+	addQuery(values, incomingRaw)
+	return values.Encode()
+}
+
+func addQuery(dst url.Values, raw string) {
+	if raw == "" {
+		return
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return
+	}
+	for key, list := range values {
+		for _, value := range list {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func (h *Handler) writeError(w http.ResponseWriter, status int, kind string, err error) {
+	h.logger.Warn("request failed", "kind", kind, "error", err)
+	writeJSONError(w, status, kind, err.Error())
+}
+
+func writeJSONError(w http.ResponseWriter, status int, kind, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error":   message,
+		"type":    kind,
+		"message": "upstream request failed and no valid cache entry was available",
+	})
+}
+
+func classifyError(err error) *UpstreamError {
+	if errors.Is(err, context.Canceled) {
+		return &UpstreamError{Kind: ErrCanceled, Err: err}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &UpstreamError{Kind: ErrTimeout, Err: err}
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return &UpstreamError{Kind: ErrTimeout, Err: err}
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return &UpstreamError{Kind: ErrDNS, Err: err}
+	}
+
+	var tlsRecordErr tls.RecordHeaderError
+	var tlsCertErr *tls.CertificateVerificationError
+	if errors.As(err, &tlsRecordErr) || errors.As(err, &tlsCertErr) {
+		return &UpstreamError{Kind: ErrTLS, Err: err}
+	}
+
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return &UpstreamError{Kind: ErrConnectionRefused, Err: err}
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && errors.Is(opErr.Err, syscall.ECONNREFUSED) {
+		return &UpstreamError{Kind: ErrConnectionRefused, Err: err}
+	}
+	var pathErr *os.SyscallError
+	if errors.As(err, &pathErr) && errors.Is(pathErr.Err, syscall.ECONNREFUSED) {
+		return &UpstreamError{Kind: ErrConnectionRefused, Err: err}
+	}
+
+	return &UpstreamError{Kind: ErrUpstream, Err: err}
+}
+
+
+server/cache_api.go:
+package server
+
+import (
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"strings"
+
+	"github.com/Psyko-devs/mockbird/internal/cache"
+)
+
+type CacheManager interface {
+	Snapshot() ([]cache.SnapshotEntry, error)
+	Clear() error
+	Delete(key string) error
+}
+
+func RegisterCacheRoutes(mux *http.ServeMux, manager CacheManager, logger *slog.Logger) {
+	mux.HandleFunc("/__mockbird/cache", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			entries, err := manager.Snapshot()
+			if err != nil {
+				logger.Error("failed to inspect cache", "error", err)
+				writeError(w, http.StatusInternalServerError, "failed to inspect cache")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
+		case http.MethodDelete:
+			if err := manager.Clear(); err != nil {
+				logger.Error("failed to clear cache", "error", err)
+				writeError(w, http.StatusInternalServerError, "failed to clear cache")
+				return
+			}
+			logger.Info("cache cleared")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.Header().Set("Allow", "GET, DELETE")
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	})
+
+	mux.HandleFunc("/__mockbird/cache/", func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.URL.Path, "/__mockbird/cache/")
+		if key == "" {
+			writeError(w, http.StatusBadRequest, "cache key is required")
+			return
+		}
+		if r.Method != http.MethodDelete {
+			w.Header().Set("Allow", "DELETE")
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if err := manager.Delete(key); err != nil {
+			logger.Warn("failed to delete cache entry", "key", key, "error", err)
+			writeError(w, http.StatusBadRequest, "failed to delete cache entry")
+			return
+		}
+		logger.Info("cache entry invalidated", "key", key)
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+
+storage/disk.go:
+package storage
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Psyko-devs/mockbird/internal/cache"
+)
+
+var (
+	ErrNotFound   = errors.New("cache entry not found")
+	ErrCorrupt    = errors.New("cache entry corrupt")
+	errBadKey     = errors.New("invalid cache key")
+	indexName     = "index.json"
+	fileMode      = os.FileMode(0644)
+	directoryMode = os.FileMode(0755)
+	timeFormat    = time.RFC3339Nano
+)
+
+type diskRecord struct {
+	StatusCode int         `json:"status_code"`
+	Headers    http.Header `json:"headers"`
+	Body       []byte      `json:"body"`
+	CreatedAt  string      `json:"created_at"`
+	Checksum   string      `json:"checksum"`
+}
+
+type indexRecord struct {
+	Key        string      `json:"key"`
+	StatusCode int         `json:"status_code"`
+	Headers    http.Header `json:"headers,omitempty"`
+	BodySize   int         `json:"body_size"`
+	CreatedAt  string      `json:"created_at"`
+	Checksum   string      `json:"checksum"`
+}
+
+type DiskStore struct {
+	dir       string
+	index     map[string]cache.SnapshotEntry
+	mu        sync.RWMutex
+	persistCh chan struct{}
+}
+
+func NewDiskStore(dir string) (*DiskStore, error) {
+	if err := os.MkdirAll(dir, directoryMode); err != nil {
+		return nil, err
+	}
+	store := &DiskStore{
+		dir:       dir,
+		index:     make(map[string]cache.SnapshotEntry),
+		persistCh: make(chan struct{}, 1),
+	}
+	if err := store.rebuildIndex(); err != nil {
+		return nil, err
+	}
+	go store.indexWriter()
+	return store, nil
+}
+
+func (s *DiskStore) Load(key string) (cache.Entry, error) {
+	if err := validateKey(key); err != nil {
+		return cache.Entry{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.path(key))
+	if errors.Is(err, os.ErrNotExist) {
+		delete(s.index, key)
+		s.scheduleIndexPersistLocked()
+		return cache.Entry{}, ErrNotFound
+	}
+	if err != nil {
+		return cache.Entry{}, err
+	}
+
+	var record diskRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return cache.Entry{}, fmt.Errorf("%w: %s", ErrCorrupt, key)
+	}
+	entry, err := record.entry()
+	if err != nil {
+		return cache.Entry{}, fmt.Errorf("%w: %s", ErrCorrupt, key)
+	}
+	if checksum(entry) != record.Checksum {
+		return cache.Entry{}, fmt.Errorf("%w: checksum mismatch for %s", ErrCorrupt, key)
+	}
+	return entry, nil
+}
+
+func (s *DiskStore) Save(key string, entry cache.Entry) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	record := newDiskRecord(entry)
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if err := s.atomicWrite(s.path(key), data); err != nil {
+		return err
+	}
+
+	s.index[key] = snapshotFromEntry(key, entry, record.Checksum)
+	s.scheduleIndexPersistLocked()
+	return nil
+}
+
+func (s *DiskStore) Delete(key string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	err := os.Remove(s.path(key))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	delete(s.index, key)
+	s.scheduleIndexPersistLocked()
+	return nil
+}
+
+func (s *DiskStore) Clear() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.dir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	s.index = make(map[string]cache.SnapshotEntry)
+	s.scheduleIndexPersistLocked()
+	return nil
+}
+
+func (s *DiskStore) Snapshot() ([]cache.SnapshotEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]cache.SnapshotEntry, 0, len(s.index))
+	for _, entry := range s.index {
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+func (s *DiskStore) rebuildIndex() error {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || entry.Name() == indexName {
+			continue
+		}
+		key := strings.TrimSuffix(entry.Name(), ".json")
+		if validateKey(key) != nil {
+			continue
+		}
+		loaded, err := s.loadWithoutLock(key)
+		if err != nil {
+			continue
+		}
+		s.index[key] = snapshotFromEntry(key, loaded, checksum(loaded))
+	}
+	return s.persistIndexLocked()
+}
+
+func (s *DiskStore) loadWithoutLock(key string) (cache.Entry, error) {
+	data, err := os.ReadFile(s.path(key))
+	if err != nil {
+		return cache.Entry{}, err
+	}
+	var record diskRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return cache.Entry{}, err
+	}
+	entry, err := record.entry()
+	if err != nil {
+		return cache.Entry{}, err
+	}
+	if checksum(entry) != record.Checksum {
+		return cache.Entry{}, ErrCorrupt
+	}
+	return entry, nil
+}
+
+func (s *DiskStore) persistIndexLocked() error {
+	records := make([]indexRecord, 0, len(s.index))
+	for _, entry := range s.index {
+		records = append(records, indexRecord{
+			Key:        entry.Key,
+			StatusCode: entry.StatusCode,
+			Headers:    http.Header(entry.Headers).Clone(),
+			BodySize:   entry.BodySize,
+			CreatedAt:  entry.CreatedAt.Format(timeFormat),
+		})
+	}
+	data, err := json.Marshal(records)
+	if err != nil {
+		return err
+	}
+	return s.atomicWrite(s.indexPath(), data)
+}
+
+func (s *DiskStore) persistIndex() error {
+	s.mu.RLock()
+	records := make([]indexRecord, 0, len(s.index))
+	for _, entry := range s.index {
+		records = append(records, indexRecord{
+			Key:        entry.Key,
+			StatusCode: entry.StatusCode,
+			Headers:    http.Header(entry.Headers).Clone(),
+			BodySize:   entry.BodySize,
+			CreatedAt:  entry.CreatedAt.Format(timeFormat),
+		})
+	}
+	s.mu.RUnlock()
+
+	data, err := json.Marshal(records)
+	if err != nil {
+		return err
+	}
+	return s.atomicWrite(s.indexPath(), data)
+}
+
+func (s *DiskStore) scheduleIndexPersistLocked() {
+	select {
+	case s.persistCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *DiskStore) indexWriter() {
+	for range s.persistCh {
+		timer := time.NewTimer(100 * time.Millisecond)
+		<-timer.C
+		for {
+			select {
+			case <-s.persistCh:
+				continue
+			default:
+			}
+			break
+		}
+		_ = s.persistIndex()
+	}
+}
+
+func (s *DiskStore) atomicWrite(path string, data []byte) error {
+	tmp, err := os.CreateTemp(s.dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, fileMode); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return syncDir(s.dir)
+}
+
+func (s *DiskStore) path(key string) string {
+	return filepath.Join(s.dir, key+".json")
+}
+
+func (s *DiskStore) indexPath() string {
+	return filepath.Join(s.dir, indexName)
+}
+
+func validateKey(key string) error {
+	if len(key) != 64 {
+		return fmt.Errorf("%w: length", errBadKey)
+	}
+	for _, r := range key {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			continue
+		}
+		return fmt.Errorf("%w: characters", errBadKey)
+	}
+	return nil
+}
+
+func checksum(entry cache.Entry) string {
+	sum := sha256.New()
+	sum.Write([]byte(fmt.Sprintf("%d\n", entry.StatusCode)))
+	sum.Write([]byte(entry.CreatedAt.UTC().Format(timeFormat)))
+	sum.Write([]byte{'\n'})
+	headerBytes, _ := json.Marshal(entry.Headers)
+	sum.Write(headerBytes)
+	sum.Write([]byte{'\n'})
+	sum.Write(entry.Body)
+	return hex.EncodeToString(sum.Sum(nil))
+}
+
+func newDiskRecord(entry cache.Entry) diskRecord {
+	return diskRecord{
+		StatusCode: entry.StatusCode,
+		Headers:    entry.Headers,
+		Body:       entry.Body,
+		CreatedAt:  entry.CreatedAt.UTC().Format(timeFormat),
+		Checksum:   checksum(entry),
+	}
+}
+
+func (r diskRecord) entry() (cache.Entry, error) {
+	createdAt, err := parseTime(r.CreatedAt)
+	if err != nil {
+		return cache.Entry{}, err
+	}
+	return cache.Entry{
+		StatusCode: r.StatusCode,
+		Headers:    r.Headers,
+		Body:       r.Body,
+		CreatedAt:  createdAt,
+	}, nil
+}
+
+func snapshotFromEntry(key string, entry cache.Entry, _ string) cache.SnapshotEntry {
+	return cache.SnapshotEntry{
+		Key:        key,
+		StatusCode: entry.StatusCode,
+		Headers:    cache.HTTPHeader(entry.Headers.Clone()),
+		BodySize:   entry.BodySize(),
+		CreatedAt:  entry.CreatedAt,
+		Source:     "disk",
+	}
+}
+
+func parseTime(value string) (time.Time, error) {
+	t, err := time.Parse(timeFormat, value)
+	if err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, value)
+}
+
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil && runtime.GOOS != "windows" {
+		return err
+	}
+	return nil
+}
+
+
+cache/key_test.go:
+package cache
+
+import (
+	"net/http"
+	"testing"
+)
+
+func TestKeyIncludesQuery(t *testing.T) {
+	a := Key(KeyRequest{Method: http.MethodGet, Path: "/users", RawQuery: "id=1"})
+	b := Key(KeyRequest{Method: http.MethodGet, Path: "/users", RawQuery: "id=2"})
+	if a == b {
+		t.Fatal("expected different keys for different queries")
+	}
+}
+
+func TestKeySortsEquivalentQueries(t *testing.T) {
+	a := Key(KeyRequest{Method: http.MethodGet, Path: "/users", RawQuery: "b=2&a=1"})
+	b := Key(KeyRequest{Method: http.MethodGet, Path: "/users", RawQuery: "a=1&b=2"})
+	if a != b {
+		t.Fatal("expected reordered query params to produce the same key")
+	}
+}
+
+func TestKeySortsRepeatedQueryValues(t *testing.T) {
+	a := Key(KeyRequest{Method: http.MethodGet, Path: "/users", RawQuery: "role=admin&role=user"})
+	b := Key(KeyRequest{Method: http.MethodGet, Path: "/users", RawQuery: "role=user&role=admin"})
+	if a != b {
+		t.Fatal("expected reordered repeated query values to produce the same key")
+	}
+}
+
+func TestKeyIncludesBodyHashForMutableMethods(t *testing.T) {
+	tests := []string{http.MethodPost, http.MethodPut, http.MethodPatch}
+	for _, method := range tests {
+		t.Run(method, func(t *testing.T) {
+			a := Key(KeyRequest{Method: method, Path: "/login", Body: []byte("A")})
+			b := Key(KeyRequest{Method: method, Path: "/login", Body: []byte("B")})
+			if a == b {
+				t.Fatalf("expected different keys for different %s bodies", method)
+			}
+		})
+	}
+}
+
+func TestKeyIgnoresBodyForGET(t *testing.T) {
+	a := Key(KeyRequest{Method: http.MethodGet, Path: "/users", Body: []byte("A")})
+	b := Key(KeyRequest{Method: http.MethodGet, Path: "/users", Body: []byte("B")})
+	if a != b {
+		t.Fatal("expected GET body to be ignored")
+	}
+}
+
+func TestKeyIncludesConfiguredVaryHeaders(t *testing.T) {
+	a := Key(KeyRequest{
+		Method:      http.MethodGet,
+		Path:        "/users",
+		Headers:     http.Header{"Authorization": []string{"Bearer A"}},
+		VaryHeaders: []string{"authorization"},
+	})
+	b := Key(KeyRequest{
+		Method:      http.MethodGet,
+		Path:        "/users",
+		Headers:     http.Header{"Authorization": []string{"Bearer B"}},
+		VaryHeaders: []string{"Authorization"},
+	})
+	if a == b {
+		t.Fatal("expected configured Vary header value to affect cache key")
+	}
+}
+
+
+cache/manager_test.go:
+package cache
+
+import (
+	"errors"
+	"net/http"
+	"testing"
+	"time"
+)
+
+type memoryStore struct {
+	entries map[string]Entry
+}
+
+func newMemoryStore() *memoryStore {
+	return &memoryStore{entries: map[string]Entry{}}
+}
+
+func (s *memoryStore) Load(key string) (Entry, error) {
+	entry, ok := s.entries[key]
+	if !ok {
+		return Entry{}, errors.New("missing")
+	}
+	return entry.DeepCopy(), nil
+}
+
+func (s *memoryStore) Save(key string, entry Entry) error {
+	s.entries[key] = entry.DeepCopy()
+	return nil
+}
+
+func (s *memoryStore) Delete(key string) error {
+	delete(s.entries, key)
+	return nil
+}
+
+func (s *memoryStore) Clear() error {
+	s.entries = map[string]Entry{}
+	return nil
+}
+
+func (s *memoryStore) Snapshot() ([]SnapshotEntry, error) {
+	out := make([]SnapshotEntry, 0, len(s.entries))
+	for key, entry := range s.entries {
+		out = append(out, SnapshotEntry{
+			Key:        key,
+			StatusCode: entry.StatusCode,
+			Headers:    HTTPHeader(entry.Headers),
+			BodySize:   len(entry.Body),
+			CreatedAt:  entry.CreatedAt,
+			Source:     "disk",
+		})
+	}
+	return out, nil
+}
+
+func TestManagerExpiresEntries(t *testing.T) {
+	store := newMemoryStore()
+	manager, err := NewManager(Options{MaxEntries: 10, TTL: time.Hour, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := Key(KeyRequest{Method: http.MethodGet, Path: "/expired"})
+	if err := manager.Set(key, Entry{StatusCode: 200, Headers: http.Header{}, Body: []byte("old"), CreatedAt: time.Now().Add(-2 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := manager.Get(key); ok {
+		t.Fatal("expected expired entry to be ignored")
+	}
+	if _, ok := store.entries[key]; ok {
+		t.Fatal("expected expired entry to be removed from disk store")
+	}
+}
+
+func TestManagerEvictsRAM(t *testing.T) {
+	store := newMemoryStore()
+	manager, err := NewManager(Options{MaxEntries: 1, TTL: time.Hour, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := Key(KeyRequest{Method: http.MethodGet, Path: "/first"})
+	second := Key(KeyRequest{Method: http.MethodGet, Path: "/second"})
+
+	_ = manager.Set(first, Entry{StatusCode: 200, Headers: http.Header{}, Body: []byte("first"), CreatedAt: time.Now()})
+	_ = manager.Set(second, Entry{StatusCode: 200, Headers: http.Header{}, Body: []byte("second"), CreatedAt: time.Now()})
+
+	if manager.Len() != 1 {
+		t.Fatalf("expected one RAM entry, got %d", manager.Len())
+	}
+	if _, ok := store.entries[first]; ok {
+		t.Fatal("expected evicted RAM entry to be removed from disk store")
+	}
+	if _, ok := store.entries[second]; !ok {
+		t.Fatal("expected newest entry to remain in disk store")
+	}
+}
+
+
+proxy/proxy_test.go:
+package proxy
+
+import (
+	"bytes"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Psyko-devs/mockbird/internal/cache"
+	"github.com/Psyko-devs/mockbird/internal/storage"
+)
+
+func newTestHandler(t *testing.T, upstream http.HandlerFunc) (*Handler, *cache.Manager) {
+	t.Helper()
+	target := httptest.NewServer(upstream)
+	t.Cleanup(target.Close)
+
+	targetURL := mustParseURL(t, target.URL)
+	store, err := storage.NewDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := cache.NewManager(cache.Options{MaxEntries: 2, TTL: time.Hour, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return New(Options{
+		Target: targetURL,
+		Cache:  manager,
+		Client: target.Client(),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}), manager
+}
+
+func newTestHandlerWithOptions(t *testing.T, upstream http.HandlerFunc, opts func(*Options)) (*Handler, *cache.Manager) {
+	t.Helper()
+	target := httptest.NewServer(upstream)
+	t.Cleanup(target.Close)
+
+	store, err := storage.NewDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := cache.NewManager(cache.Options{MaxEntries: 10, TTL: time.Hour, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := Options{
+		Target: mustParseURL(t, target.URL),
+		Cache:  manager,
+		Client: target.Client(),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	opts(&options)
+	return New(options), manager
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+func TestProxyReplaysHeadersAndStatusCodes(t *testing.T) {
+	handler, _ := newTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Location", "/created/1")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("created"))
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/items", nil))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want %d", rec.Code, http.StatusCreated)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/items", nil))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("cached status = %d, want %d", rec.Code, http.StatusCreated)
+	}
+	if got := rec.Header().Get("Location"); got != "/created/1" {
+		t.Fatalf("location = %q, want /created/1", got)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/plain" {
+		t.Fatalf("content-type = %q, want text/plain", got)
+	}
+}
+
+func TestProxyServesOfflineFromCache(t *testing.T) {
+	var calls atomic.Int32
+	handler, _ := newTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte("cached"))
+	})
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/offline", nil))
+
+	handler.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, io.ErrUnexpectedEOF
+	})}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/offline", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "cached" {
+		t.Fatalf("body = %q, want cached", rec.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestProxyDeduplicatesConcurrentMisses(t *testing.T) {
+	var calls atomic.Int32
+	handler, _ := newTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	done := make(chan struct{}, 10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/same", nil))
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestProxyCacheInvalidation(t *testing.T) {
+	var calls atomic.Int32
+	handler, manager := newTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{byte('0' + calls.Add(1))})
+	})
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/invalidate", nil))
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/invalidate"})
+	if err := manager.Delete(key); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/invalidate", nil))
+	if rec.Body.String() != "2" {
+		t.Fatalf("body = %q, want 2 after invalidation", rec.Body.String())
+	}
+}
+
+func TestProxyTreatsReorderedQueriesAsEquivalent(t *testing.T) {
+	var calls atomic.Int32
+	handler, _ := newTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(r.URL.RawQuery))
+	})
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/users?b=2&a=1", nil))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/users?a=1&b=2", nil))
+
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1 for equivalent query order", calls.Load())
+	}
+	if rec.Body.String() != "a=1&b=2" && rec.Body.String() != "b=2&a=1" {
+		t.Fatalf("unexpected cached body %q", rec.Body.String())
+	}
+}
+
+func TestProxyUsesConfiguredVaryHeaders(t *testing.T) {
+	var calls atomic.Int32
+	handler, _ := newTestHandlerWithOptions(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(r.Header.Get("Authorization")))
+	}, func(opts *Options) {
+		opts.VaryHeaders = []string{"Authorization"}
+	})
+
+	reqA := httptest.NewRequest(http.MethodGet, "/profile", nil)
+	reqA.Header.Set("Authorization", "Bearer A")
+	handler.ServeHTTP(httptest.NewRecorder(), reqA)
+
+	reqB := httptest.NewRequest(http.MethodGet, "/profile", nil)
+	reqB.Header.Set("Authorization", "Bearer B")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqB)
+
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls = %d, want 2 for different Vary values", calls.Load())
+	}
+	if rec.Body.String() != "Bearer B" {
+		t.Fatalf("body = %q, want Bearer B", rec.Body.String())
+	}
+}
+
+func TestProxyPrettyDoesNotMutateStoredCache(t *testing.T) {
+	handler, manager := newTestHandlerWithOptions(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}, func(opts *Options) {
+		opts.Pretty = true
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+	if rec.Body.String() == `{"ok":true}` {
+		t.Fatal("expected pretty response formatting at response boundary")
+	}
+
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/json"})
+	entry, ok := manager.Get(key)
+	if !ok {
+		t.Fatal("expected cache entry")
+	}
+	if string(entry.Body) != `{"ok":true}` {
+		t.Fatalf("stored body = %q, want raw compact JSON", string(entry.Body))
+	}
+}
+
+func TestProxyRejectsOversizedRequestBodies(t *testing.T) {
+	handler, _ := newTestHandlerWithOptions(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be called for oversized body")
+	}, func(opts *Options) {
+		opts.MaxBody = 4
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/too-large", bytes.NewBufferString("12345")))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+
+server/cache_api_test.go:
+package server
+
+import (
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/Psyko-devs/mockbird/internal/cache"
+	"github.com/Psyko-devs/mockbird/internal/storage"
+)
+
+func TestCacheAPIInspectClearAndDelete(t *testing.T) {
+	store, err := storage.NewDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := cache.NewManager(cache.Options{MaxEntries: 10, TTL: time.Hour, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/cached"})
+	if err := manager.Set(key, cache.Entry{StatusCode: 200, Headers: http.Header{"ETag": []string{"abc"}}, Body: []byte("ok"), CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	RegisterCacheRoutes(mux, manager, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/__mockbird/cache", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inspect status = %d, want 200", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/__mockbird/cache/"+key, nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want 204", rec.Code)
+	}
+	if _, ok := manager.Get(key); ok {
+		t.Fatal("expected deleted entry to be absent")
+	}
+
+	if err := manager.Set(key, cache.Entry{StatusCode: 200, Headers: http.Header{}, Body: []byte("ok"), CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/__mockbird/cache", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("clear status = %d, want 204", rec.Code)
+	}
+	if _, ok := manager.Get(key); ok {
+		t.Fatal("expected cleared entry to be absent")
+	}
+}
+
+
+storage/disk_test.go:
+package storage
+
+import (
+	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/Psyko-devs/mockbird/internal/cache"
+)
+
+func TestDiskStorePersistsFullEntry(t *testing.T) {
+	store, err := NewDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/resource", RawQuery: "id=1"})
+	want := cache.Entry{
+		StatusCode: http.StatusCreated,
+		Headers: http.Header{
+			"Content-Type":  []string{"application/json"},
+			"ETag":          []string{`"abc"`},
+			"Cache-Control": []string{"max-age=60"},
+		},
+		Body:      []byte(`{"ok":true}`),
+		CreatedAt: time.Now().UTC().Truncate(time.Second),
+	}
+
+	if err := store.Save(key, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.StatusCode != want.StatusCode {
+		t.Fatalf("status code = %d, want %d", got.StatusCode, want.StatusCode)
+	}
+	if got.Headers.Get("ETag") != want.Headers.Get("ETag") {
+		t.Fatalf("etag = %q, want %q", got.Headers.Get("ETag"), want.Headers.Get("ETag"))
+	}
+	if string(got.Body) != string(want.Body) {
+		t.Fatalf("body = %q, want %q", got.Body, want.Body)
+	}
+	if !got.CreatedAt.Equal(want.CreatedAt) {
+		t.Fatalf("created_at = %s, want %s", got.CreatedAt, want.CreatedAt)
+	}
+}
+
+func TestDiskStoreDetectsCorruption(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewDiskStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/corrupt"})
+	entry := cache.Entry{
+		StatusCode: http.StatusOK,
+		Headers:    http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       []byte("original"),
+		CreatedAt:  time.Now().UTC(),
+	}
+	if err := store.Save(key, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, key+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data[:len(data)-2], []byte(`xx"}`)...)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Load(key); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Load error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestDiskStoreSnapshotUsesIndex(t *testing.T) {
+	store, err := NewDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := cache.Key(cache.KeyRequest{Method: http.MethodGet, Path: "/snapshot"})
+	if err := store.Save(key, cache.Entry{StatusCode: 200, Headers: http.Header{}, Body: []byte("ok"), CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Key != key || entries[0].BodySize != 2 {
+		t.Fatalf("snapshot = %#v, want indexed metadata for %s", entries, key)
+	}
+}
+

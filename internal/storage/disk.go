@@ -1,16 +1,14 @@
 package storage
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
+	"sort"
 	"sync"
 	"time"
 
@@ -19,78 +17,56 @@ import (
 
 var (
 	ErrNotFound   = errors.New("cache entry not found")
-	ErrCorrupt    = errors.New("cache entry corrupt")
+	ErrCorrupt    = errors.New("cache wal record corrupt")
 	errBadKey     = errors.New("invalid cache key")
-	indexName     = "index.json"
-	fileMode      = os.FileMode(0644)
 	directoryMode = os.FileMode(0755)
-	timeFormat    = time.RFC3339Nano
+	fileMode      = os.FileMode(0644)
+	walName       = "cache.wal"
 )
 
-type diskRecord struct {
-	StatusCode int         `json:"status_code"`
-	Headers    http.Header `json:"headers"`
-	Body       []byte      `json:"body"`
-	CreatedAt  string      `json:"created_at"`
-	Checksum   string      `json:"checksum"`
-}
-
-type indexRecord struct {
-	Key        string      `json:"key"`
-	StatusCode int         `json:"status_code"`
-	Headers    http.Header `json:"headers,omitempty"`
-	BodySize   int         `json:"body_size"`
-	CreatedAt  string      `json:"created_at"`
-	Checksum   string      `json:"checksum"`
+type WALEntry struct {
+	Op        string       `json:"op"`
+	Key       string       `json:"key,omitempty"`
+	Entry     *cache.Entry `json:"entry,omitempty"`
+	Timestamp int64        `json:"timestamp"`
 }
 
 type DiskStore struct {
-	dir   string
-	index map[string]cache.SnapshotEntry
-	mu    sync.RWMutex
+	dir             string
+	walPath         string
+	entries         map[string]cache.Entry
+	mu              sync.RWMutex
+	walMu           sync.Mutex
+	compactionEvery time.Duration
 }
 
 func NewDiskStore(dir string) (*DiskStore, error) {
 	if err := os.MkdirAll(dir, directoryMode); err != nil {
 		return nil, err
 	}
-	store := &DiskStore{dir: dir, index: make(map[string]cache.SnapshotEntry)}
-	if err := store.loadIndex(); err != nil {
+
+	store := &DiskStore{
+		dir:             dir,
+		walPath:         filepath.Join(dir, walName),
+		entries:         make(map[string]cache.Entry),
+		compactionEvery: time.Minute,
+	}
+	if err := store.replayWAL(); err != nil {
 		return nil, err
 	}
+	go store.compactionLoop()
 	return store, nil
 }
 
-func (s *DiskStore) Load(key string) (cache.Entry, error) {
-	if err := validateKey(key); err != nil {
-		return cache.Entry{}, err
-	}
+func (s *DiskStore) Restore() ([]cache.StoredEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data, err := os.ReadFile(s.path(key))
-	if errors.Is(err, os.ErrNotExist) {
-		delete(s.index, key)
-		_ = s.persistIndexLocked()
-		return cache.Entry{}, ErrNotFound
+	entries := make([]cache.StoredEntry, 0, len(s.entries))
+	for key, entry := range s.entries {
+		entries = append(entries, cache.StoredEntry{Key: key, Entry: entry})
 	}
-	if err != nil {
-		return cache.Entry{}, err
-	}
-
-	var record diskRecord
-	if err := json.Unmarshal(data, &record); err != nil {
-		return cache.Entry{}, fmt.Errorf("%w: %s", ErrCorrupt, key)
-	}
-	entry, err := record.entry()
-	if err != nil {
-		return cache.Entry{}, fmt.Errorf("%w: %s", ErrCorrupt, key)
-	}
-	if checksum(entry) != record.Checksum {
-		return cache.Entry{}, fmt.Errorf("%w: checksum mismatch for %s", ErrCorrupt, key)
-	}
-	return entry, nil
+	return entries, nil
 }
 
 func (s *DiskStore) Save(key string, entry cache.Entry) error {
@@ -98,20 +74,20 @@ func (s *DiskStore) Save(key string, entry cache.Entry) error {
 		return err
 	}
 
+	record := WALEntry{
+		Op:        "set",
+		Key:       key,
+		Entry:     &entry,
+		Timestamp: time.Now().UnixNano(),
+	}
+	if err := s.appendWAL(record); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	record := newDiskRecord(entry)
-	data, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
-	if err := s.atomicWrite(s.path(key), data); err != nil {
-		return err
-	}
-
-	s.index[key] = snapshotFromEntry(key, entry, record.Checksum)
-	return s.persistIndexLocked()
+	s.entries[key] = entry
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *DiskStore) Delete(key string) error {
@@ -119,149 +95,178 @@ func (s *DiskStore) Delete(key string) error {
 		return err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	err := os.Remove(s.path(key))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	record := WALEntry{
+		Op:        "delete",
+		Key:       key,
+		Timestamp: time.Now().UnixNano(),
+	}
+	if err := s.appendWAL(record); err != nil {
 		return err
 	}
-	delete(s.index, key)
-	return s.persistIndexLocked()
+
+	s.mu.Lock()
+	delete(s.entries, key)
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *DiskStore) Clear() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
+	record := WALEntry{
+		Op:        "clear",
+		Timestamp: time.Now().UnixNano(),
+	}
+	if err := s.appendWAL(record); err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		if err := os.Remove(filepath.Join(s.dir, entry.Name())); err != nil {
-			return err
-		}
-	}
-	s.index = make(map[string]cache.SnapshotEntry)
-	return s.persistIndexLocked()
+
+	s.mu.Lock()
+	s.entries = make(map[string]cache.Entry)
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *DiskStore) Snapshot() ([]cache.SnapshotEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	out := make([]cache.SnapshotEntry, 0, len(s.index))
-	for _, entry := range s.index {
-		out = append(out, entry)
+	out := make([]cache.SnapshotEntry, 0, len(s.entries))
+	for key, entry := range s.entries {
+		out = append(out, cache.SnapshotEntry{
+			Key:        key,
+			StatusCode: entry.StatusCode,
+			Headers:    cache.HTTPHeader(entry.Headers.Clone()),
+			BodySize:   entry.BodySize(),
+			CreatedAt:  entry.CreatedAt,
+			Source:     "disk",
+			Expired:    false,
+		})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out, nil
 }
 
-func (s *DiskStore) loadIndex() error {
-	data, err := os.ReadFile(s.indexPath())
+func (s *DiskStore) appendWAL(record WALEntry) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	s.walMu.Lock()
+	defer s.walMu.Unlock()
+
+	file, err := os.OpenFile(s.walPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, fileMode)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func (s *DiskStore) replayWAL() error {
+	file, err := os.Open(s.walPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return s.rebuildIndex()
+		return nil
 	}
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
-	var records []indexRecord
-	if err := json.Unmarshal(data, &records); err != nil {
-		return s.rebuildIndex()
+	reader := bufio.NewReader(file)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 && err == nil {
+			s.applyWALLine(line)
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
-	for _, record := range records {
+}
+
+func (s *DiskStore) applyWALLine(line []byte) {
+	var record WALEntry
+	if err := json.Unmarshal(line, &record); err != nil {
+		return
+	}
+
+	switch record.Op {
+	case "set":
+		if record.Entry == nil || validateKey(record.Key) != nil {
+			return
+		}
+		s.entries[record.Key] = *record.Entry
+	case "delete":
 		if validateKey(record.Key) != nil {
-			continue
+			return
 		}
-		createdAt, err := parseTime(record.CreatedAt)
-		if err != nil {
-			continue
-		}
-		s.index[record.Key] = cache.SnapshotEntry{
-			Key:        record.Key,
-			StatusCode: record.StatusCode,
-			Headers:    cache.HTTPHeader(record.Headers.Clone()),
-			BodySize:   record.BodySize,
-			CreatedAt:  createdAt,
-			Source:     "disk",
-		}
+		delete(s.entries, record.Key)
+	case "clear":
+		s.entries = make(map[string]cache.Entry)
 	}
-	return nil
 }
 
-func (s *DiskStore) rebuildIndex() error {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return err
+func (s *DiskStore) compactionLoop() {
+	ticker := time.NewTicker(s.compactionEvery)
+	defer ticker.Stop()
+	for range ticker.C {
+		_ = s.Compact()
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || entry.Name() == indexName {
-			continue
-		}
-		key := strings.TrimSuffix(entry.Name(), ".json")
-		if validateKey(key) != nil {
-			continue
-		}
-		loaded, err := s.loadWithoutLock(key)
-		if err != nil {
-			continue
-		}
-		s.index[key] = snapshotFromEntry(key, loaded, checksum(loaded))
-	}
-	return s.persistIndexLocked()
 }
 
-func (s *DiskStore) loadWithoutLock(key string) (cache.Entry, error) {
-	data, err := os.ReadFile(s.path(key))
-	if err != nil {
-		return cache.Entry{}, err
-	}
-	var record diskRecord
-	if err := json.Unmarshal(data, &record); err != nil {
-		return cache.Entry{}, err
-	}
-	entry, err := record.entry()
-	if err != nil {
-		return cache.Entry{}, err
-	}
-	if checksum(entry) != record.Checksum {
-		return cache.Entry{}, ErrCorrupt
-	}
-	return entry, nil
-}
+func (s *DiskStore) Compact() error {
+	s.walMu.Lock()
+	defer s.walMu.Unlock()
 
-func (s *DiskStore) persistIndexLocked() error {
-	records := make([]indexRecord, 0, len(s.index))
-	for _, entry := range s.index {
-		records = append(records, indexRecord{
-			Key:        entry.Key,
-			StatusCode: entry.StatusCode,
-			Headers:    http.Header(entry.Headers).Clone(),
-			BodySize:   entry.BodySize,
-			CreatedAt:  entry.CreatedAt.Format(timeFormat),
+	s.mu.RLock()
+	records := make([]WALEntry, 0, len(s.entries))
+	keys := make([]string, 0, len(s.entries))
+	for key := range s.entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		entry := s.entries[key]
+		records = append(records, WALEntry{
+			Op:        "set",
+			Key:       key,
+			Entry:     &entry,
+			Timestamp: time.Now().UnixNano(),
 		})
 	}
-	data, err := json.Marshal(records)
-	if err != nil {
-		return err
-	}
-	return s.atomicWrite(s.indexPath(), data)
-}
+	s.mu.RUnlock()
 
-func (s *DiskStore) atomicWrite(path string, data []byte) error {
-	tmp, err := os.CreateTemp(s.dir, ".tmp-*")
+	tmp, err := os.CreateTemp(s.dir, ".cache-wal-*.tmp")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 
-	if _, err := tmp.Write(data); err != nil {
+	writer := bufio.NewWriter(tmp)
+	for _, record := range records {
+		data, err := json.Marshal(record)
+		if err != nil {
+			_ = tmp.Close()
+			return err
+		}
+		if _, err := writer.Write(append(data, '\n')); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+	}
+	if err := writer.Flush(); err != nil {
 		_ = tmp.Close()
 		return err
 	}
@@ -275,18 +280,7 @@ func (s *DiskStore) atomicWrite(path string, data []byte) error {
 	if err := os.Chmod(tmpName, fileMode); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	return syncDir(s.dir)
-}
-
-func (s *DiskStore) path(key string) string {
-	return filepath.Join(s.dir, key+".json")
-}
-
-func (s *DiskStore) indexPath() string {
-	return filepath.Join(s.dir, indexName)
+	return os.Rename(tmpName, s.walPath)
 }
 
 func validateKey(key string) error {
@@ -298,72 +292,6 @@ func validateKey(key string) error {
 			continue
 		}
 		return fmt.Errorf("%w: characters", errBadKey)
-	}
-	return nil
-}
-
-func checksum(entry cache.Entry) string {
-	sum := sha256.New()
-	sum.Write([]byte(fmt.Sprintf("%d\n", entry.StatusCode)))
-	sum.Write([]byte(entry.CreatedAt.UTC().Format(timeFormat)))
-	sum.Write([]byte{'\n'})
-	headerBytes, _ := json.Marshal(entry.Headers)
-	sum.Write(headerBytes)
-	sum.Write([]byte{'\n'})
-	sum.Write(entry.Body)
-	return hex.EncodeToString(sum.Sum(nil))
-}
-
-func newDiskRecord(entry cache.Entry) diskRecord {
-	return diskRecord{
-		StatusCode: entry.StatusCode,
-		Headers:    entry.Headers,
-		Body:       entry.Body,
-		CreatedAt:  entry.CreatedAt.UTC().Format(timeFormat),
-		Checksum:   checksum(entry),
-	}
-}
-
-func (r diskRecord) entry() (cache.Entry, error) {
-	createdAt, err := parseTime(r.CreatedAt)
-	if err != nil {
-		return cache.Entry{}, err
-	}
-	return cache.Entry{
-		StatusCode: r.StatusCode,
-		Headers:    r.Headers,
-		Body:       r.Body,
-		CreatedAt:  createdAt,
-	}, nil
-}
-
-func snapshotFromEntry(key string, entry cache.Entry, _ string) cache.SnapshotEntry {
-	return cache.SnapshotEntry{
-		Key:        key,
-		StatusCode: entry.StatusCode,
-		Headers:    cache.HTTPHeader(entry.Headers.Clone()),
-		BodySize:   entry.BodySize(),
-		CreatedAt:  entry.CreatedAt,
-		Source:     "disk",
-	}
-}
-
-func parseTime(value string) (time.Time, error) {
-	t, err := time.Parse(timeFormat, value)
-	if err == nil {
-		return t, nil
-	}
-	return time.Parse(time.RFC3339, value)
-}
-
-func syncDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := f.Sync(); err != nil && runtime.GOOS != "windows" {
-		return err
 	}
 	return nil
 }

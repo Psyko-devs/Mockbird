@@ -235,15 +235,11 @@ func writeEntry(w http.ResponseWriter, entry cache.Entry, pretty bool) {
 }
 
 func readResponseBody(r io.Reader, limit int64) ([]byte, bool, error) {
-	var buf bytes.Buffer
-	n, err := io.CopyN(&buf, r, limit+1)
-	if err != nil && !errors.Is(err, io.EOF) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
 		return nil, false, err
 	}
-	if n > limit {
-		return buf.Bytes(), true, nil
-	}
-	return buf.Bytes(), false, nil
+	return body, int64(len(body)) > limit, nil
 }
 
 func copyRequestHeader(dst, src http.Header) {

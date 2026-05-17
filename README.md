@@ -3,7 +3,7 @@
 Mockbird is a lightweight HTTP reverse proxy that records upstream responses and replays them from a deterministic two-level cache:
 
 - L1 RAM cache: bounded LRU for hot responses.
-- L2 disk cache: persistent compact JSON records with full response metadata.
+- L2 disk cache: append-only `cache.wal` records with full response metadata.
 
 Correctness rules: cache keys are deterministic, stored entries are immutable, and runtime formatting flags never change persisted cache bytes.
 
@@ -69,24 +69,28 @@ Examples:
 
 ## Cache Format
 
-Each disk entry is stored as `<sha256>.json`. The file is compact JSON with status, headers, raw body bytes, creation time, and a checksum:
+Disk persistence is a single append-only WAL file named `cache.wal`. Each line is one JSON record:
 
 ```json
 {
-  "status_code": 200,
-  "headers": {
-    "Content-Type": ["application/json"],
-    "ETag": ["\"abc\""]
+  "op": "set",
+  "key": "64-character-sha256-key",
+  "entry": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"],
+      "ETag": ["\"abc\""]
+    },
+    "body": "eyJvayI6dHJ1ZX0=",
+    "created_at": "2026-05-17T12:00:00Z"
   },
-  "body": "eyJvayI6dHJ1ZX0=",
-  "created_at": "2026-05-17T12:00:00Z",
-  "checksum": "..."
+  "timestamp": 1779028800000000000
 }
 ```
 
 `body` is base64 because Go encodes `[]byte` that way in JSON. This preserves binary, compressed, and non-JSON responses.
 
-The storage layer also maintains `index.json` so cache inspection does not load every body from disk.
+Startup replays `cache.wal` sequentially into an in-memory index. Corrupted partial tail records are skipped, so an interrupted append does not poison recovery. A background compactor periodically rewrites the WAL into the current live `set` records, removing stale duplicates and keeping the file bounded.
 
 ## Cache Management API
 
@@ -103,8 +107,10 @@ curl -X DELETE http://127.0.0.1:8080/__mockbird/cache/{key}
 - `cmd/mockbird` only parses config, creates dependencies, wires routes, and handles shutdown.
 - `internal/proxy` owns HTTP behavior: request body limits, upstream URL construction, header forwarding, response replay, and singleflight request deduplication.
 - `internal/cache` owns pure cache semantics: keys, TTL, LRU, RAM/disk coordination, invalidation, and snapshots.
-- `internal/storage` owns persistence: compact JSON, atomic writes, fsync where supported, checksums, and metadata indexing.
+- `internal/storage` owns persistence: append-only WAL writes, startup replay, corrupted-tail tolerance, and background compaction.
 - `internal/server` owns management routes only.
+
+LRU eviction removes the corresponding disk entry as well. In this design, `-max-ram` bounds the active cache set rather than allowing disk to grow without limit behind RAM.
 
 ## Migration Notes
 
@@ -112,7 +118,7 @@ curl -X DELETE http://127.0.0.1:8080/__mockbird/cache/{key}
 - Old cache files named like `GET_users.json` are not compatible. The new cache uses deterministic SHA-256 filenames.
 - `-pretty` no longer changes stored cache files. It only formats JSON while writing the HTTP response and never touches non-JSON or encoded payloads.
 - Query parameter order no longer creates duplicate entries.
-- Cache inspection now uses `index.json`; deleting cache files manually may require deleting `index.json` or restarting to rebuild from disk.
+- Cache persistence now uses `cache.wal`; old per-entry `.json` cache files and `index.json` are ignored by the new storage layer.
 
 ## Test
 

@@ -3,17 +3,23 @@ package cache
 import (
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 type Store interface {
-	Load(key string) (Entry, error)
 	Save(key string, entry Entry) error
 	Delete(key string) error
 	Clear() error
 	Snapshot() ([]SnapshotEntry, error)
+	Restore() ([]StoredEntry, error)
+}
+
+type StoredEntry struct {
+	Key   string
+	Entry Entry
 }
 
 type Options struct {
@@ -23,9 +29,12 @@ type Options struct {
 }
 
 type Manager struct {
-	ttl   time.Duration
-	ram   *lru.Cache[string, Entry]
-	store Store
+	ttl              time.Duration
+	ram              *lru.Cache[string, Entry]
+	store            Store
+	mu               sync.Mutex
+	suppressEvict    bool
+	pendingEvictions []string
 }
 
 type SnapshotEntry struct {
@@ -51,36 +60,47 @@ func NewManager(opts Options) (*Manager, error) {
 		return nil, fmt.Errorf("store is required")
 	}
 
-	ram, err := lru.New[string, Entry](opts.MaxEntries)
+	manager := &Manager{
+		ttl:   opts.TTL,
+		store: opts.Store,
+	}
+
+	ram, err := lru.NewWithEvict[string, Entry](opts.MaxEntries, func(key string, _ Entry) {
+		if manager.suppressEvict {
+			return
+		}
+		manager.pendingEvictions = append(manager.pendingEvictions, key)
+	})
 	if err != nil {
 		return nil, err
 	}
+	manager.ram = ram
 
-	return &Manager{ttl: opts.TTL, ram: ram, store: opts.Store}, nil
+	if err := manager.restore(); err != nil {
+		return nil, err
+	}
+
+	return manager, nil
 }
 
 func (m *Manager) Get(key string) (Entry, bool) {
 	now := time.Now()
+
+	m.mu.Lock()
 	if entry, ok := m.ram.Get(key); ok {
 		if entry.Expired(now, m.ttl) {
+			m.suppressEvict = true
 			m.ram.Remove(key)
+			m.suppressEvict = false
+			m.mu.Unlock()
 			_ = m.store.Delete(key)
 			return Entry{}, false
 		}
+		m.mu.Unlock()
 		return entry, true
 	}
-
-	entry, err := m.store.Load(key)
-	if err != nil {
-		return Entry{}, false
-	}
-	if entry.Expired(now, m.ttl) {
-		_ = m.store.Delete(key)
-		return Entry{}, false
-	}
-
-	m.ram.Add(key, entry)
-	return entry, true
+	m.mu.Unlock()
+	return Entry{}, false
 }
 
 func (m *Manager) Set(key string, entry Entry) error {
@@ -90,28 +110,52 @@ func (m *Manager) Set(key string, entry Entry) error {
 	if err := m.store.Save(key, entry); err != nil {
 		return err
 	}
+
+	m.mu.Lock()
 	m.ram.Add(key, entry)
+	evicted := m.takePendingEvictionsLocked()
+	m.mu.Unlock()
+	m.deleteEvicted(evicted)
 	return nil
 }
 
 func (m *Manager) Delete(key string) error {
+	if err := m.store.Delete(key); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	m.suppressEvict = true
 	m.ram.Remove(key)
-	return m.store.Delete(key)
+	m.suppressEvict = false
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) Clear() error {
+	if err := m.store.Clear(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	m.suppressEvict = true
 	m.ram.Purge()
-	return m.store.Clear()
+	m.suppressEvict = false
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) Len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.ram.Len()
 }
 
 func (m *Manager) Snapshot() ([]SnapshotEntry, error) {
-	seen := make(map[string]SnapshotEntry, m.ram.Len())
 	now := time.Now()
 
+	m.mu.Lock()
+	seen := make(map[string]SnapshotEntry, m.ram.Len())
 	for _, key := range m.ram.Keys() {
 		entry, ok := m.ram.Peek(key)
 		if !ok {
@@ -119,6 +163,7 @@ func (m *Manager) Snapshot() ([]SnapshotEntry, error) {
 		}
 		seen[key] = snapshot(key, entry, "ram", now, m.ttl)
 	}
+	m.mu.Unlock()
 
 	diskEntries, err := m.store.Snapshot()
 	if err != nil {
@@ -150,5 +195,47 @@ func snapshot(key string, entry Entry, source string, now time.Time, ttl time.Du
 		CreatedAt:  entry.CreatedAt,
 		Source:     source,
 		Expired:    entry.Expired(now, ttl),
+	}
+}
+
+func (m *Manager) restore() error {
+	entries, err := m.store.Restore()
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Entry.CreatedAt.Before(entries[j].Entry.CreatedAt)
+	})
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, restored := range entries {
+		if restored.Entry.Expired(now, m.ttl) {
+			_ = m.store.Delete(restored.Key)
+			continue
+		}
+		m.ram.Add(restored.Key, restored.Entry)
+		evicted := m.takePendingEvictionsLocked()
+		m.mu.Unlock()
+		m.deleteEvicted(evicted)
+		m.mu.Lock()
+	}
+	return nil
+}
+
+func (m *Manager) takePendingEvictionsLocked() []string {
+	if len(m.pendingEvictions) == 0 {
+		return nil
+	}
+	evicted := append([]string(nil), m.pendingEvictions...)
+	m.pendingEvictions = m.pendingEvictions[:0]
+	return evicted
+}
+
+func (m *Manager) deleteEvicted(keys []string) {
+	for _, key := range keys {
+		_ = m.store.Delete(key)
 	}
 }
